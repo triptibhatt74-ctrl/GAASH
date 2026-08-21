@@ -1,0 +1,25 @@
+# Environment / secrets
+.env
+
+# Database
+gaash.db
+*.db
+
+# Python virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Testing / tooling
+.pytest_cache/
+.mypy_cache/
+
+# VS Code local settings
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,144 @@
+[
+  {
+    "id": "tele-manas-india",
+    "name": "Tele-MANAS",
+    "type": "tele_mental_health",
+    "district": null,
+    "region": "India (available in Jammu & Kashmir)",
+    "services": [
+      "Tele-mental-health support",
+      "Mental wellness support",
+      "Mental-health information and guidance"
+    ],
+    "phone": [
+      "14416",
+      "1-800-891-4416"
+    ],
+    "address": null,
+    "website": "https://telemanas.mohfw.gov.in/",
+    "latitude": null,
+    "longitude": null,
+    "languages": [],
+    "availability": "National tele-mental-health service; confirm current availability on the official Tele-MANAS service",
+    "emergency": false,
+    "verified": true,
+    "source": "Ministry of Health & Family Welfare, Government of India — Tele-MANAS",
+    "sourceUrl": "https://telemanas.mohfw.gov.in/",
+    "lastVerified": "2026-08-18",
+    "notes": "For immediate danger, use local emergency services rather than relying only on Tele-MANAS."
+  },
+  {
+    "id": "gpdh-jammu",
+    "name": "Government Psychiatric Diseases Hospital, GMC Jammu",
+    "type": "government_psychiatric_hospital",
+    "district": "Jammu",
+    "region": "Jammu",
+    "services": [
+      "Psychiatric outpatient services",
+      "Psychiatric inpatient services",
+      "Preventive mental-health services",
+      "Curative mental-health services",
+      "Rehabilitative mental-health services",
+      "Emergency psychiatric care"
+    ],
+    "phone": [
+      "9541921501"
+    ],
+    "address": "Psychiatric Diseases Hospital, GMC Jammu, Jammu, Jammu & Kashmir",
+    "website": "https://gmcjammu.jk.gov.in/Psychiatry%20Hospital%20Citizen%20Charter.aspx",
+    "latitude": null,
+    "longitude": null,
+    "languages": [],
+    "availability": "Check the official citizen charter/contact page for current OPD timings",
+    "emergency": true,
+    "verified": true,
+    "source": "Government Medical College Jammu — Psychiatric Diseases Hospital Citizen Charter",
+    "sourceUrl": "https://gmcjammu.jk.gov.in/Psychiatry%20Hospital%20Citizen%20Charter.aspx",
+    "lastVerified": "2026-08-18",
+    "notes": "Official GMC Jammu citizen charter describes GPDH as a tertiary psychiatric hospital offering preventive, curative and rehabilitative mental-health services."
+  },
+  {
+    "id": "imhans-k-rainawari",
+    "name": "Institute of Mental Health & Neurosciences (IMHANS-K), Rainawari",
+    "type": "government_psychiatric_hospital",
+    "district": "Srinagar",
+    "region": "Kashmir",
+    "services": [
+      "Psychiatric outpatient services",
+      "Psychiatric inpatient services",
+      "Mental-health assessment and treatment",
+      "24x7 psychiatric emergency services",
+      "Free indoor/outdoor medication",
+      "Basic investigations for in-patients"
+    ],
+    "phone": [
+      "0194-2504114"
+    ],
+    "address": "Badamwari Park Road, Botaraj Colony, Rainawari, Srinagar, Jammu & Kashmir 190003",
+    "website": "https://gmcs.ac.in/InnerPagelevel1.aspx?assid=RM3f%2F8RgswM%3D&pid=jb4x3ZCEg%2FM%3D",
+    "latitude": null,
+    "longitude": null,
+    "languages": [],
+    "availability": "OPD 10:00 AM–4:00 PM; 24x7 emergency services",
+    "emergency": true,
+    "verified": true,
+    "source": "Government Medical College Srinagar — Psychiatry Disease Hospital / Department of Psychiatry",
+    "sourceUrl": "https://www.gmcs.ac.in/InnerPagelevel2.aspx?assid=rQktMwB+dk8%3D&pid=1EOyxifQUig%3D",
+    "lastVerified": "2026-08-18",
+    "notes": "GMC Srinagar describes IMHANS-K at Rainawari as the 140-bed component of Government Psychiatric Diseases Hospital."
+  },
+  {
+    "id": "cghu-smhs-srinagar",
+    "name": "Community General Hospital Unit (CGHU), SMHS Hospital",
+    "type": "government_psychiatry_unit",
+    "district": "Srinagar",
+    "region": "Kashmir",
+    "services": [
+      "Psychiatric services",
+      "Mental-health assessment and treatment"
+    ],
+    "phone": [],
+    "address": "SMHS Hospital Complex, Karan Nagar, Srinagar, Jammu & Kashmir",
+    "website": "https://www.gmcs.ac.in/Departments.aspx?id=rQktMwB+dk8%3D",
+    "latitude": null,
+    "longitude": null,
+    "languages": [],
+    "availability": "Confirm current unit-specific timings with GMC Srinagar",
+    "emergency": false,
+    "verified": true,
+    "source": "Government Medical College Srinagar — Department of Psychiatry",
+    "sourceUrl": "https://www.gmcs.ac.in/Departments.aspx?id=rQktMwB+dk8%3D",
+    "lastVerified": "2026-08-18",
+    "notes": "GMC Srinagar lists CGHU as a 20-bed psychiatry unit within the SMHS Hospital premises."
+  },
+  {
+    "id": "gmc-anantnag-psychiatry",
+    "name": "Department of Psychiatry, Government Medical College Anantnag",
+    "type": "government_psychiatry_department",
+    "district": "Anantnag",
+    "region": "South Kashmir",
+    "services": [
+      "Psychiatric outpatient services",
+      "Mental-health assessment and treatment"
+    ],
+    "phone": [
+      "+91-1932-227624",
+      "+91-1932-227625"
+    ],
+    "address": "Associated Hospital / District Hospital, Janglatmandi, Anantnag, Jammu & Kashmir",
+    "website": "https://gmcanantnag.net/Department/Department17.aspx",
+    "latitude": null,
+    "longitude": null,
+    "languages": [],
+    "availability": "Confirm the current psychiatry clinic schedule with GMC Anantnag",
+    "emergency": false,
+    "verified": true,
+    "source": "Government Medical College Anantnag — Department of Psychiatry",
+    "sourceUrl": "https://gmcanantnag.net/Department/Department17.aspx",
+    "additionalSourceUrls": [
+      "https://gmcanantnag.net/Contact.aspx"
+    ],
+    "lastVerified": "2026-08-18",
+    "notes": "The official department page states that psychiatry services have been provided since the college's establishment and describes a substantial outpatient caseload."
+  }
+]
