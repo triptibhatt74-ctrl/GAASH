@@ -86,10 +86,16 @@ CORS_ORIGINS = [
 SUPPORTED_LANGUAGES = {"en", "hi", "ur", "ks", "doi", "hinglish"}
 SUPPORTED_THEMES = {"light", "dark", "system"}
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_gaash_tables()
+    yield
+
 app = FastAPI(
     title="GAASH Bot API",
     description="GAASH conversational screening and support backend",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
