@@ -2998,5 +2998,7 @@ async def submit_screening_answer(
 
     return result
 
+init_gaash_tables()
+
 if __name__ == "__main__":
     uvicorn.run("bot:app", host=HOST, port=PORT, reload=True)
