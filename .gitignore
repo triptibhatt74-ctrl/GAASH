@@ -23,3 +23,8 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+Pasted text.txt
+*.jpeg
+python-3.11.6-amd64.exe
+jk_chatbot_ytci_dib_training_dataset.json
