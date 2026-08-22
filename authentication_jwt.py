@@ -850,7 +850,7 @@ def resend_otp(data: RequestOTPRequest):
         cursor.execute(
             """
             UPDATE otp_verifications
-            SET used = 1
+            SET used = True
             WHERE user_id = %s
               AND purpose = 'REGISTRATION'
               AND used = 0
@@ -928,8 +928,13 @@ def forgot_password(data: RequestOTPRequest):
         user_id, registered_email = user[0], user[2]
 
         conn.execute(
-            "UPDATE otp_verifications SET used = True"
-            "WHERE user_id = %s AND purpose = 'PASSWORD_RESET' AND used = False",
+            """
+            UPDATE otp_verifications
+            SET used = TRUE
+            WHERE user_id = %s
+            AND purpose = 'PASSWORD_RESET'
+            AND used = FALSE
+            """,
             (user_id,),
         )
 
