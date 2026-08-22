@@ -1062,11 +1062,32 @@ def _get_or_start_session_sync(
         return conn.execute(
             "SELECT * FROM screening_sessions WHERE session_id=?", (session_id,)
         ).fetchone()
+        
+VALID_SCALES = {"PHQ-9", "GAD-7", "PSS-10"}
 
+def normalize_scale(value: str) -> str:
+    normalized = value.strip().upper().replace("_", "-")
+    
+    aliases = {
+        "PHQ9": "PHQ-9",
+        "PHQ-9": "PHQ-9",
+        "GAD7": "GAD-7",
+        "GAD-7": "GAD-7",
+        "PSS10": "PSS-10",
+        "PSS-10": "PSS-10",
+    }
+
+    if normalized not in aliases:
+        raise ValueError(f"Unsupported screening scale: {value}")
+
+    return aliases[normalized]
 
 async def get_or_start_screening_session(
     user_id: int, conversation_id: Optional[str], scale: str
 ) -> sqlite3.Row:
+    scale = normalize_scale(scale)
+    if scale not in VALID_SCALES:
+        raise ValueError(f"Unsupported screening scale: {scale}")
     return await run_db(_get_or_start_session_sync, user_id, conversation_id, scale)
 
 
@@ -2413,7 +2434,6 @@ async def update_profile(
     return {
         "status": "updated"
     }
-
 
 # ---------------------------------------------------------------------------
 # CHAT
