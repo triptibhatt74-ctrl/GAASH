@@ -387,6 +387,18 @@ def init_gaash_tables() -> None:
             )
             """
         )
+        
+        _ensure_columns(
+            cur,
+            "user_profiles",
+            {
+                "display_name": "TEXT",
+                "preferred_language": "TEXT",
+                "theme": "TEXT",
+                "notification_prefs": "TEXT",
+                "updated_at": "TIMESTAMP",
+            },
+        )
 
         # ---- durable wellbeing-report snapshots ----
         cur.execute(
