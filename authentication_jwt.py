@@ -39,6 +39,9 @@ HOST = os.getenv("AUTH_HOST") or os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("AUTH_PORT") or os.getenv("PORT", "8004"))
 DATABASE = str(Path(__file__).resolve().parent / "gaash.db")
 
+print("AUTH FILE:", Path(__file__).resolve())
+print("AUTH DATABASE:", DATABASE)
+
 JWT_SECRET = os.getenv("GAASH_JWT_SECRET", "CHANGE_THIS_IN_PRODUCTION")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
@@ -119,7 +122,7 @@ def init_db() -> None:
             conn,
             "users",
             {
-                "is_verified": "INTEGER NOT NULL DEFAULT 1"
+                "is_verified": "INTEGER NOT NULL DEFAULT 0"
             },
         )
 
