@@ -610,7 +610,7 @@ def get_reset_user_id(
             )
 
         cur.execute(
-            "UPDATE reset_tokens SET used = 1 WHERE id = %s",
+            "UPDATE reset_tokens SET used = True WHERE id = %s",
             (record_id,),
         )
         conn.commit()
@@ -706,7 +706,7 @@ def register(data: RegisterRequest):
         cursor.execute(
             """
             INSERT INTO users (username, email, password, is_verified)
-            VALUES (%s, %s, %s, 0)
+            VALUES (%s, %s, %s, False)
             """,
             (
                 username,
@@ -720,8 +720,8 @@ def register(data: RegisterRequest):
         cursor.execute(
             """
             UPDATE otp_verifications
-            SET used = 1
-            WHERE user_id = %s AND purpose = 'REGISTRATION' AND used = 0
+            SET used = True
+            WHERE user_id = %s AND purpose = 'REGISTRATION' AND used = False
             """,
             (user_id,),
         )
@@ -789,7 +789,7 @@ def verify_registration(data: VerifyRegistrationRequest):
             )
 
         conn.execute(
-            "UPDATE users SET is_verified = 1 WHERE id = %s",
+            "UPDATE users SET is_verified = True WHERE id = %s",
             (user_id,),
         )
         conn.commit()
@@ -822,7 +822,7 @@ def resend_otp(data: RequestOTPRequest):
             FROM otp_verifications
             WHERE user_id = %s
               AND purpose = 'REGISTRATION'
-              AND used = 0
+              AND used = False
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -927,8 +927,8 @@ def forgot_password(data: RequestOTPRequest):
         user_id, registered_email = user[0], user[2]
 
         conn.execute(
-            "UPDATE otp_verifications SET used = 1 "
-            "WHERE user_id = %s AND purpose = 'PASSWORD_RESET' AND used = 0",
+            "UPDATE otp_verifications SET used = True"
+            "WHERE user_id = %s AND purpose = 'PASSWORD_RESET' AND used = False",
             (user_id,),
         )
 
