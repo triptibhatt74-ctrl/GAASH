@@ -4,6 +4,7 @@
 # Database
 gaash.db
 *.db
+*.pyc
 
 # Python virtual environment
 .venv/

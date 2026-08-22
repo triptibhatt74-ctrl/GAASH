@@ -6,7 +6,7 @@ import os
 
 import secrets
 import smtplib
-import sqlite3
+import psycopg
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -37,10 +37,10 @@ app = FastAPI(
 # AUTH_HOST/AUTH_PORT let both services share one .env without colliding with bot.py's HOST/PORT.
 HOST = os.getenv("AUTH_HOST") or os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("AUTH_PORT") or os.getenv("PORT", "8004"))
-DATABASE = str(Path(__file__).resolve().parent / "gaash.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://gaashai_db_user:n5zReAPcVTqeNzzbbt7MLwcw0giuJEZk@dpg-da4k1sk9v7es738e8450-a.ohio-postgres.render.com/gaashai_db").strip()
 
-print("AUTH FILE:", Path(__file__).resolve())
-print("AUTH DATABASE:", DATABASE)
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not configured.")
 
 JWT_SECRET = os.getenv("GAASH_JWT_SECRET", "CHANGE_THIS_IN_PRODUCTION")
 JWT_ALGORITHM = "HS256"
@@ -92,11 +92,11 @@ class OTPServiceError(Exception):
 # DATABASE
 # ============================================================
 
-def get_connection() -> sqlite3.Connection:
-    return sqlite3.connect(DATABASE, check_same_thread=False)
+def get_connection():
+    return psycopg.connect(DATABASE_URL)
 
 
-def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict) -> None:
+def _ensure_columns(conn: psycopg.Connection, table: str, columns: dict) -> None:
     existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
     for name, ddl in columns.items():
         if name not in existing:
@@ -105,69 +105,62 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict) -> None
 
 def init_db() -> None:
     with contextlib.closing(get_connection()) as conn:
-        # Existing users default to verified so that already-registered users are
-        # not locked out by the new OTP flow.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGSERIAL PRIMARY KEY,
+                    username TEXT UNIQUE NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    password TEXT NOT NULL,
+                    is_verified BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
-        _ensure_columns(
-            conn,
-            "users",
-            {
-                "is_verified": "INTEGER NOT NULL DEFAULT 0"
-            },
-        )
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS otp_verifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                email TEXT NOT NULL,
-                purpose TEXT NOT NULL,
-                otp_hash TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                used INTEGER NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(user_id) REFERENCES users(id)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS otp_verifications (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    email TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    otp_hash TEXT NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    used BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_otp_user_purpose
-            ON otp_verifications (user_id, purpose, created_at)
-            """
-        )
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reset_tokens (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                token_hash TEXT UNIQUE NOT NULL,
-                used INTEGER NOT NULL DEFAULT 0,
-                expires_at TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(user_id) REFERENCES users(id)
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_otp_user_purpose
+                ON otp_verifications (user_id, purpose, created_at)
+                """
             )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_reset_token_hash
-            ON reset_tokens (token_hash)
-            """
-        )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reset_tokens (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    token_hash TEXT UNIQUE NOT NULL,
+                    used BOOLEAN NOT NULL DEFAULT FALSE,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_reset_token_hash
+                ON reset_tokens (token_hash)
+                """
+            )
 
         conn.commit()
 
@@ -229,21 +222,21 @@ def is_email_address(value: str) -> bool:
 
 
 def _lookup_user_by_email(
-    conn: sqlite3.Connection,
+    conn,
     raw_email: str,
-) -> Optional[sqlite3.Row]:
+):
     email = normalize_email(raw_email)
 
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT id, username, email, password, is_verified
-        FROM users
-        WHERE LOWER(email) = LOWER(?)
-        """,
-        (email,),
-    )
-    return cursor.fetchone()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, username, email, password, is_verified
+            FROM users
+            WHERE LOWER(email) = LOWER(%s)
+            """,
+            (email,),
+        )
+        return cur.fetchone()
 
 def create_access_token(user_id: int, gaash_id: str) -> str:
     now = datetime.now(timezone.utc)
@@ -268,14 +261,30 @@ def create_password_reset_token(user_id: int) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
-def store_reset_token(conn: sqlite3.Connection, user_id: int, token: str) -> None:
-    payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    expires_at = datetime.fromtimestamp(payload["exp"], tz=timezone.utc).isoformat()
-    token_hash = hash_reset_token(token)
-    conn.execute(
-        "INSERT INTO reset_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
-        (user_id, token_hash, expires_at),
+def store_reset_token(conn, user_id: int, token: str) -> None:
+    payload = jwt.decode(
+        token,
+        JWT_SECRET,
+        algorithms=[JWT_ALGORITHM],
     )
+
+    expires_at = datetime.fromtimestamp(
+        payload["exp"],
+        tz=timezone.utc,
+    )
+
+    token_hash = hash_reset_token(token)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO reset_tokens
+            (user_id, token_hash, expires_at)
+            VALUES (%s, %s, %s)
+            """,
+            (user_id, token_hash, expires_at),
+        )
+
     conn.commit()
 
 
@@ -382,7 +391,7 @@ def send_otp(email: str, otp: str, purpose: str) -> None:
 
 
 def store_otp(
-    conn: sqlite3.Connection,
+    conn,
     user_id: int,
     email: str,
     purpose: str,
@@ -393,74 +402,107 @@ def store_otp(
     expires_at = (
         datetime.now(timezone.utc)
         + timedelta(minutes=OTP_EXPIRY_MINUTES)
-    ).isoformat()
-
-    conn.execute(
-        """
-        INSERT INTO otp_verifications
-        (user_id, email, purpose, otp_hash, expires_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            email,
-            purpose,
-            otp_hash,
-            expires_at,
-        ),
     )
 
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO otp_verifications
+            (user_id, email, purpose, otp_hash, expires_at)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                user_id,
+                email,
+                purpose,
+                otp_hash,
+                expires_at,
+            ),
+        )
 
 def verify_and_consume_otp(
-    conn: sqlite3.Connection,
+    conn,
     user_id: int,
     email: str,
     purpose: str,
     otp: str,
 ) -> bool:
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, otp_hash, expires_at, attempts, used
-        FROM otp_verifications
-        WHERE user_id = ? AND LOWER(email) = LOWER(?) AND purpose = ?
-        ORDER BY id DESC LIMIT 1
-        """,
-        (user_id, email, purpose),
-    )
-    row = cur.fetchone()
-    if row is None:
-        return False
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, otp_hash, expires_at, attempts, used
+            FROM otp_verifications
+            WHERE user_id = %s
+              AND LOWER(email) = LOWER(%s)
+              AND purpose = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (user_id, email, purpose),
+        )
 
-    otp_id, stored_hash, expires_at, attempts, used = row
-    if used:
-        return False
+        row = cur.fetchone()
 
-    try:
-        expiry = datetime.fromisoformat(expires_at)
-    except ValueError:
-        return False
+        if row is None:
+            return False
 
-    if datetime.now(timezone.utc) >= expiry:
-        cur.execute("UPDATE otp_verifications SET used = 1 WHERE id = ?", (otp_id,))
-        conn.commit()
-        return False
+        otp_id, stored_hash, expiry, attempts, used = row
 
-    if attempts >= MAX_OTP_ATTEMPTS:
-        cur.execute("UPDATE otp_verifications SET used = 1 WHERE id = ?", (otp_id,))
-        conn.commit()
-        return False
+        if used:
+            return False
 
-    cur.execute(
-        "UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = ?",
-        (otp_id,),
-    )
-    conn.commit()
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
 
-    if not hmac.compare_digest(stored_hash, hash_otp(otp)):
-        return False
+        if datetime.now(timezone.utc) >= expiry:
+            cur.execute(
+                """
+                UPDATE otp_verifications
+                SET used = TRUE
+                WHERE id = %s
+                """,
+                (otp_id,),
+            )
+            conn.commit()
+            return False
 
-    cur.execute("UPDATE otp_verifications SET used = 1 WHERE id = ?", (otp_id,))
+        if attempts >= MAX_OTP_ATTEMPTS:
+            cur.execute(
+                """
+                UPDATE otp_verifications
+                SET used = TRUE
+                WHERE id = %s
+                """,
+                (otp_id,),
+            )
+            conn.commit()
+            return False
+
+        cur.execute(
+            """
+            UPDATE otp_verifications
+            SET attempts = attempts + 1
+            WHERE id = %s
+            """,
+            (otp_id,),
+        )
+
+        if not hmac.compare_digest(
+            stored_hash,
+            hash_otp(otp),
+        ):
+            conn.commit()
+            return False
+
+        cur.execute(
+            """
+            UPDATE otp_verifications
+            SET used = TRUE
+            WHERE id = %s
+            """,
+            (otp_id,),
+        )
+
     conn.commit()
     return True
 
@@ -529,7 +571,7 @@ def get_reset_user_id(
     with contextlib.closing(get_connection()) as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, user_id, used, expires_at FROM reset_tokens WHERE token_hash = ?",
+            "SELECT id, user_id, used, expires_at FROM reset_tokens WHERE token_hash = %s",
             (token_hash,),
         )
         row = cur.fetchone()
@@ -568,7 +610,7 @@ def get_reset_user_id(
             )
 
         cur.execute(
-            "UPDATE reset_tokens SET used = 1 WHERE id = ?",
+            "UPDATE reset_tokens SET used = 1 WHERE id = %s",
             (record_id,),
         )
         conn.commit()
@@ -642,7 +684,7 @@ def register(data: RegisterRequest):
         cursor = conn.cursor()
 
         cursor.execute(
-            "SELECT id FROM users WHERE LOWER(username) = LOWER(?)",
+            "SELECT id FROM users WHERE LOWER(username) = LOWER(%s)",
             (username,),
         )
         if cursor.fetchone():
@@ -652,7 +694,7 @@ def register(data: RegisterRequest):
             )
 
         cursor.execute(
-            "SELECT id FROM users WHERE LOWER(email) = LOWER(?)",
+            "SELECT id FROM users WHERE LOWER(email) = LOWER(%s)",
             (email,),
         )
         if cursor.fetchone():
@@ -664,7 +706,7 @@ def register(data: RegisterRequest):
         cursor.execute(
             """
             INSERT INTO users (username, email, password, is_verified)
-            VALUES (?, ?, ?, 0)
+            VALUES (%s, %s, %s, 0)
             """,
             (
                 username,
@@ -673,13 +715,13 @@ def register(data: RegisterRequest):
             ),
         )
 
-        user_id = cursor.lastrowid
+        user_id = cursor.fetchone()[0]
 
         cursor.execute(
             """
             UPDATE otp_verifications
             SET used = 1
-            WHERE user_id = ? AND purpose = 'REGISTRATION' AND used = 0
+            WHERE user_id = %s AND purpose = 'REGISTRATION' AND used = 0
             """,
             (user_id,),
         )
@@ -747,7 +789,7 @@ def verify_registration(data: VerifyRegistrationRequest):
             )
 
         conn.execute(
-            "UPDATE users SET is_verified = 1 WHERE id = ?",
+            "UPDATE users SET is_verified = 1 WHERE id = %s",
             (user_id,),
         )
         conn.commit()
@@ -778,7 +820,7 @@ def resend_otp(data: RequestOTPRequest):
             """
             SELECT created_at
             FROM otp_verifications
-            WHERE user_id = ?
+            WHERE user_id = %s
               AND purpose = 'REGISTRATION'
               AND used = 0
             ORDER BY id DESC
@@ -808,7 +850,7 @@ def resend_otp(data: RequestOTPRequest):
             """
             UPDATE otp_verifications
             SET used = 1
-            WHERE user_id = ?
+            WHERE user_id = %s
               AND purpose = 'REGISTRATION'
               AND used = 0
             """,
@@ -886,7 +928,7 @@ def forgot_password(data: RequestOTPRequest):
 
         conn.execute(
             "UPDATE otp_verifications SET used = 1 "
-            "WHERE user_id = ? AND purpose = 'PASSWORD_RESET' AND used = 0",
+            "WHERE user_id = %s AND purpose = 'PASSWORD_RESET' AND used = 0",
             (user_id,),
         )
 
@@ -954,7 +996,7 @@ def reset_password(
 ):
     with contextlib.closing(get_connection()) as conn:
         conn.execute(
-            "UPDATE users SET password = ? WHERE id = ?",
+            "UPDATE users SET password = %s WHERE id = %s",
             (hash_password(data.new_password), user_id),
         )
         conn.commit()
@@ -972,7 +1014,7 @@ def get_current_user(user_id: int = Depends(get_current_user_id)):
             """
             SELECT id, username, email, created_at
             FROM users
-            WHERE id = ?
+            WHERE id = %s
             """,
             (user_id,),
         )

@@ -11,3 +11,4 @@ pillow
 numpy
 opencv-python<5
 python-multipart
+psycopg[binary]
