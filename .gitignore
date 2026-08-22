@@ -12,6 +12,7 @@ gaash.db
 # Python virtual environments
 .venv/
 venv/
+.venv311/
 
 # Python cache / compiled files
 __pycache__/
