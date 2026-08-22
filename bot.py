@@ -20,7 +20,11 @@ from datetime import date, datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, TypeAlias, TypeVar
-
+from privacy import (
+    create_privacy_tables,
+    get_privacy_acknowledgement,
+    get_voice_transcription_consent,
+)
 import jwt
 import uvicorn
 from dotenv import load_dotenv
@@ -847,6 +851,8 @@ def init_gaash_tables() -> None:
                 )
                 """
             )
+            
+        create_privacy_tables(conn)
 
         conn.commit()
 
@@ -1343,19 +1349,82 @@ def get_current_user_id(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Bearer access token required.",
         )
+
     if not JWT_SECRET:
         logger.error("GAASH_JWT_SECRET not configured.")
-        raise HTTPException(status_code=503, detail="Authentication temporarily unavailable.")
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication temporarily unavailable.",
+        )
+
     try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+        )
+
         if payload.get("purpose") != "access":
             raise jwt.InvalidTokenError("Unexpected token purpose")
+
         user_id = int(payload["sub"])
+
     except (jwt.InvalidTokenError, KeyError, ValueError, TypeError):
-        raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired access token.",
+        )
+
     if is_access_token_revoked(credentials.credentials):
-        raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired access token.",
+        )
+
+    # Privacy acknowledgement check
+    try:
+        with get_conn() as conn:
+            acknowledgement = get_privacy_acknowledgement(
+                conn,
+                user_id,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Unable to check privacy acknowledgement: %s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Privacy preferences are temporarily unavailable.",
+        ) from exc
+
+    if acknowledgement is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Privacy notice acknowledgement required.",
+        )
+
     return user_id
+
+def require_voice_transcription_consent(user_id: int) -> None:
+    try:
+        with get_conn() as conn:
+            consent = get_voice_transcription_consent(conn, user_id)
+    except Exception as exc:
+        logger.warning(
+            "Unable to check voice transcription consent: %s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Voice privacy preferences are temporarily unavailable.",
+        ) from exc
+
+    if not consent["granted"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Voice transcription requires your separate privacy choice.",
+        )
 
 
 def get_current_user(user_id: int = Depends(get_current_user_id)) -> DatabaseRow:
@@ -3018,7 +3087,7 @@ async def read_validated_audio(audio: UploadFile) -> tuple[bytes, str]:
 
     audio_bytes = await audio.read(MAX_AUDIO_BYTES + 1)
     if not audio_bytes:
-        raise HTTPException(status_code=422, detail="The audio recording is empty.")
+        raise HTTPException(status_code=400, detail="The audio recording is empty.")
     if len(audio_bytes) > MAX_AUDIO_BYTES:
         raise HTTPException(status_code=413, detail="The audio recording is too large.")
 
@@ -3031,6 +3100,10 @@ async def read_validated_audio(audio: UploadFile) -> tuple[bytes, str]:
     # Raw audio is intentionally held only for this request and never written
     # to a file or included in application logs.
     return audio_bytes, detected_type
+
+def _is_uncertain_transcript(value: str) -> bool:
+    normalised = value.strip().lower()
+    return normalised in {"", "[unclear]", "unclear", "[inaudible]", "inaudible", "no speech", "no audible speech"}
 
 
 async def transcribe_audio(
@@ -3076,10 +3149,10 @@ async def transcribe_audio(
 
     text = (response.text or "").strip()
 
-    if not text:
+    if _is_uncertain_transcript(text):
         raise HTTPException(
-            status_code=502,
-            detail="Voice transcription returned no text.",
+            status_code=422,
+            detail="Could not transcribe that recording clearly.",
         )
 
     return text
@@ -3846,7 +3919,6 @@ async def recommendations(
 
 # ---------------------------------------------------------------------------
 # VOICE
-# ---------------------------------------------------------------------------
 
 @app.post("/voice/transcribe", response_model=VoiceTranscriptionResponse)
 async def voice_transcribe(
@@ -3854,9 +3926,23 @@ async def voice_transcribe(
     audio: UploadFile = File(...),
     user_id: int = Depends(get_current_user_id),
 ):
-    enforce_rate_limit(request, "voice-transcribe", limit=10, window_seconds=600)
+    enforce_rate_limit(
+        request,
+        "voice-transcribe",
+        limit=10,
+        window_seconds=600,
+    )
+
+    # Voice transcription is an optional processing choice separate
+    # from general privacy-notice acknowledgement.
+    require_voice_transcription_consent(user_id)
+
     audio_bytes, mime_type = await read_validated_audio(audio)
-    transcript = await transcribe_audio(audio_bytes, mime_type)
+
+    transcript = await transcribe_audio(
+        audio_bytes,
+        mime_type,
+    )
 
     return {
         "transcript": transcript

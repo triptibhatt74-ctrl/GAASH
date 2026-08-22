@@ -26,7 +26,15 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-
+from privacy import (
+    current_policy_effective_date,
+    current_policy_version,
+    create_privacy_tables,
+    get_privacy_acknowledgement,
+    get_voice_transcription_consent,
+    record_privacy_acknowledgement,
+    record_voice_transcription_consent,
+)
 
 load_dotenv()
 logger = logging.getLogger("gaash.auth")
@@ -206,6 +214,7 @@ def init_db() -> None:
                 )
                 """
             )
+        create_privacy_tables(conn)
 
         conn.commit()
 
@@ -737,6 +746,32 @@ class VerifyResetOTPRequest(BaseModel):
 
 class ResetPasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=8, max_length=100)
+    
+class PrivacyAcceptRequest(BaseModel):
+    policy_version: str = Field(..., min_length=1, max_length=64)
+    locale: Optional[str] = Field(default=None, min_length=2, max_length=16)
+
+
+class VoiceTranscriptionConsentRequest(BaseModel):
+    granted: bool
+    locale: Optional[str] = Field(default=None, min_length=2, max_length=16)
+
+
+class PrivacyPolicyMetadataResponse(BaseModel):
+    policy_version: str
+    effective_date: str
+
+
+class VoiceTranscriptionConsentResponse(BaseModel):
+    granted: bool
+    recorded_at: Optional[datetime] = None
+    policy_version: Optional[str] = None
+
+
+class PrivacyStatusResponse(PrivacyPolicyMetadataResponse):
+    accepted: bool
+    accepted_at: Optional[datetime] = None
+    voice_transcription: VoiceTranscriptionConsentResponse
 
 
 class AuthMessageResponse(BaseModel):
@@ -784,6 +819,70 @@ def home():
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "Gaash Authentication API"}
+
+@app.get("/privacy/policy", response_model=PrivacyPolicyMetadataResponse)
+def get_privacy_policy_metadata():
+    """Public metadata lets the static notice show the server's current version."""
+    return {
+        "policy_version": current_policy_version(),
+        "effective_date": current_policy_effective_date(),
+    }
+
+
+@app.get("/privacy/status", response_model=PrivacyStatusResponse)
+def get_privacy_status(user_id: int = Depends(get_current_user_id)):
+    with contextlib.closing(get_connection()) as conn:
+        acknowledgement = get_privacy_acknowledgement(conn, user_id)
+        voice_consent = get_voice_transcription_consent(conn, user_id)
+    return {
+        "policy_version": current_policy_version(),
+        "effective_date": current_policy_effective_date(),
+        "accepted": acknowledgement is not None,
+        "accepted_at": acknowledgement["accepted_at"] if acknowledgement else None,
+        "voice_transcription": voice_consent,
+    }
+
+
+@app.post("/privacy/accept", response_model=PrivacyStatusResponse)
+def accept_privacy_notice(data: PrivacyAcceptRequest, user_id: int = Depends(get_current_user_id)):
+    try:
+        with contextlib.closing(get_connection()) as conn:
+            acknowledgement = record_privacy_acknowledgement(
+                conn,
+                user_id=user_id,
+                policy_version=data.policy_version.strip(),
+                locale=data.locale.strip() if data.locale else None,
+            )
+            voice_consent = get_voice_transcription_consent(conn, user_id)
+            conn.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {
+        "policy_version": current_policy_version(),
+        "effective_date": current_policy_effective_date(),
+        "accepted": True,
+        "accepted_at": acknowledgement["accepted_at"],
+        "voice_transcription": voice_consent,
+    }
+
+
+@app.post("/privacy/voice-transcription-consent", response_model=VoiceTranscriptionConsentResponse)
+def set_voice_transcription_consent(data: VoiceTranscriptionConsentRequest, user_id: int = Depends(get_current_user_id)):
+    """Record a separately withdrawable choice for third-party audio transcription."""
+    with contextlib.closing(get_connection()) as conn:
+        if get_privacy_acknowledgement(conn, user_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Privacy notice acknowledgement required.",
+            )
+        consent = record_voice_transcription_consent(
+            conn,
+            user_id=user_id,
+            granted=data.granted,
+            locale=data.locale.strip() if data.locale else None,
+        )
+        conn.commit()
+    return consent
 
 
 @app.post("/auth/register", response_model=AuthMessageResponse)
