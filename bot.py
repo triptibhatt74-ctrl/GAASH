@@ -9,13 +9,14 @@ import json
 import logging
 import os
 import re
-import sqlite3
+import psycopg
 import uuid
+from psycopg.rows import dict_row
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, TypeVar
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, TypeAlias, TypeVar
 
 import jwt
 import uvicorn
@@ -40,7 +41,11 @@ GEMINI_TIMEOUT_SECONDS = float(
     os.environ.get("GEMINI_TIMEOUT_SECONDS", "20")
 )
 
-DATABASE = str(Path(__file__).resolve().parent / "gaash.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not configured.")
+
 RESOURCES_FILE = os.environ.get("RESOURCES_FILE", str(Path(__file__).resolve().parent / "resources.json"))
 
 # Must match GAASH_JWT_SECRET / algorithm used by authentication_jwt.py.
@@ -255,12 +260,59 @@ score = null.
 # ---------------------------------------------------------------------------
 
 T = TypeVar("T")
+DatabaseRow: TypeAlias = Dict[str, Any]
+
+
+def _postgres_sql(query: str) -> str:
+    """Translate legacy SQLite qmark placeholders for Psycopg at one boundary."""
+    return query.replace("?", "%s")
+
+
+class _PostgresCursor:
+    def __init__(self, cursor: Any) -> None:
+        self._cursor = cursor
+
+    def execute(self, query: str, params: Any = None) -> "_PostgresCursor":
+        if params is None:
+            self._cursor.execute(_postgres_sql(query))
+        else:
+            self._cursor.execute(_postgres_sql(query), params)
+        return self
+
+    def __enter__(self) -> "_PostgresCursor":
+        self._cursor.__enter__()
+        return self
+
+    def __exit__(self, *args: Any) -> Any:
+        return self._cursor.__exit__(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+
+class _PostgresConnection:
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def execute(self, query: str, params: Any = None) -> _PostgresCursor:
+        cursor = self._connection.execute(_postgres_sql(query), params)
+        return _PostgresCursor(cursor)
+
+    def cursor(self, *args: Any, **kwargs: Any) -> _PostgresCursor:
+        return _PostgresCursor(self._connection.cursor(*args, **kwargs))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
 
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
+    raw_conn = psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+    )
+    conn = _PostgresConnection(raw_conn)
+
     try:
         yield conn
     finally:
@@ -271,417 +323,581 @@ async def run_db(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     return await asyncio.to_thread(partial(fn, *args, **kwargs))
 
 
-def _ensure_columns(cur: sqlite3.Cursor, table: str, columns: Dict[str, str]) -> None:
-    existing = {row["name"] for row in cur.execute(f"PRAGMA table_info({table})")}
-    for name, ddl in columns.items():
-        if name not in existing:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
-
-
 def _iso_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def init_gaash_tables() -> None:
     with get_conn() as conn:
-        cur = conn.cursor()
+        with conn.cursor() as cur:
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                email_or_phone TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            # ---------------------------------------------------------
+            # USERS
+            # Must match authentication_jwt.py exactly
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGSERIAL PRIMARY KEY,
+                    username TEXT UNIQUE NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    password TEXT NOT NULL,
+                    is_verified BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS conversations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT UNIQUE NOT NULL,
-                user_id INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            # ---------------------------------------------------------
+            # CONVERSATIONS
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id BIGSERIAL PRIMARY KEY,
+                    conversation_id TEXT UNIQUE NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations (user_id, created_at)"
-        )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS conversation_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
-                content TEXT NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conv_user
+                ON conversations (user_id, created_at)
+                """
             )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_conv_user_ts ON conversation_messages (user_id, timestamp)"
-        )
-        _ensure_columns(
-            cur,
-            "conversation_messages",
-            {"conversation_id": "TEXT"},
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_conv_msg_conv ON conversation_messages (user_id, conversation_id, id)"
-        )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS assessment_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                assessment_type TEXT NOT NULL
-                    CHECK (assessment_type IN ('PHQ-9','GAD-7','PSS-10')),
-                item_id INTEGER NOT NULL,
-                score INTEGER,
-                evidence TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_messages (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    conversation_id TEXT,
+                    role TEXT NOT NULL
+                        CHECK (role IN ('user', 'assistant')),
+                    content TEXT NOT NULL,
+                    timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_assess_user_type_ts ON assessment_records (user_id, assessment_type, timestamp)"
-        )
 
-        # ---- Screening sessions: one deliberate attempt at one scale ---------
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS screening_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT UNIQUE NOT NULL,
-                user_id INTEGER NOT NULL,
-                conversation_id TEXT,
-                scale TEXT NOT NULL CHECK (scale IN ('PHQ-9','GAD-7','PSS-10')),
-                current_item INTEGER NOT NULL DEFAULT 1,
-                status TEXT NOT NULL DEFAULT 'active'
-                    CHECK (status IN ('active','paused','completed','cancelled')),
-                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                completed_at TIMESTAMP
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conv_user_ts
+                ON conversation_messages (user_id, timestamp)
+                """
             )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_screening_session_user_state ON screening_sessions (user_id, status, started_at)"
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_screening_session_conv ON screening_sessions (user_id, conversation_id, status)"
-        )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS screening_session_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                item_id INTEGER NOT NULL,
-                raw_score INTEGER,
-                evidence TEXT,
-                answered_at TIMESTAMP,
-                UNIQUE(session_id, item_id)
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conv_msg_conv
+                ON conversation_messages (user_id, conversation_id, id)
+                """
             )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ssi_session ON screening_session_items (session_id)"
-        )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS screening_measurements (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT UNIQUE NOT NULL,
-                user_id INTEGER NOT NULL,
-                assessment_type TEXT NOT NULL
-                    CHECK (assessment_type IN ('PHQ-9','GAD-7','PSS-10')),
-                total INTEGER NOT NULL,
-                completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            # ---------------------------------------------------------
+            # ASSESSMENT RECORDS
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS assessment_records (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    assessment_type TEXT NOT NULL
+                        CHECK (
+                            assessment_type IN (
+                                'PHQ-9',
+                                'GAD-7',
+                                'PSS-10'
+                            )
+                        ),
+                    item_id INTEGER NOT NULL,
+                    score INTEGER,
+                    evidence TEXT,
+                    timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_measurement_user_time ON screening_measurements (user_id, assessment_type, completed_at)"
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_measurement_user_completed ON screening_measurements (user_id, completed_at)"
-        )
 
-        # ---- daily check-in / reflection model (dashboard + analytics) ----
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS check_ins (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                checkin_date TEXT NOT NULL,
-                mood_score INTEGER,
-                stress_score INTEGER,
-                sleep_hours REAL,
-                reflection TEXT,
-                practice_type TEXT,
-                source_conversation_id TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_assess_user_type_ts
+                ON assessment_records (
+                    user_id,
+                    assessment_type,
+                    timestamp
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_checkins_user_date ON check_ins (user_id, checkin_date)"
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_checkins_user_created ON check_ins (user_id, created_at)"
-        )
 
-        # ---- user-owned, self-edited profile/preferences (no credentials) ----
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_profiles (
-                user_id INTEGER PRIMARY KEY,
-                display_name TEXT,
-                preferred_language TEXT,
-                theme TEXT,
-                notification_prefs TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            # ---------------------------------------------------------
+            # SCREENING SESSIONS
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS screening_sessions (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id TEXT UNIQUE NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    conversation_id TEXT,
+                    scale TEXT NOT NULL
+                        CHECK (
+                            scale IN (
+                                'PHQ-9',
+                                'GAD-7',
+                                'PSS-10'
+                            )
+                        ),
+                    current_item INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK (
+                            status IN (
+                                'active',
+                                'paused',
+                                'completed',
+                                'cancelled'
+                            )
+                        ),
+                    started_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMPTZ
+                )
+                """
             )
-            """
-        )
-        
-        _ensure_columns(
-            cur,
-            "user_profiles",
-            {
-                "display_name": "TEXT",
-                "preferred_language": "TEXT",
-                "theme": "TEXT",
-                "notification_prefs": "TEXT",
-                "updated_at": "TIMESTAMP",
-            },
-        )
 
-        # ---- durable wellbeing-report snapshots ----
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS wellbeing_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                report_id TEXT UNIQUE NOT NULL,
-                user_id INTEGER NOT NULL,
-                period_start TEXT NOT NULL,
-                period_end TEXT NOT NULL,
-                snapshot_json TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_screening_session_user_state
+                ON screening_sessions (
+                    user_id,
+                    status,
+                    started_at
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_report_user ON wellbeing_reports (user_id, created_at)"
-        )
 
-        # ---- verified mental-health resources + per-user favorites ----
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS resources (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                resource_id TEXT UNIQUE NOT NULL,
-                name TEXT NOT NULL,
-                district TEXT,
-                resource_type TEXT,
-                services TEXT,
-                availability TEXT,
-                emergency INTEGER NOT NULL DEFAULT 0,
-                contact_phone TEXT,
-                contact_email TEXT,
-                contact_name TEXT,
-                address TEXT,
-                directions TEXT,
-                website TEXT,
-                verified_source TEXT,
-                source_url TEXT,
-                verification_date TEXT,
-                search_text TEXT
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_screening_session_conv
+                ON screening_sessions (
+                    user_id,
+                    conversation_id,
+                    status
+                )
+                """
             )
-            """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_resources_district ON resources (district)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_resources_type ON resources (resource_type)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_resources_emergency ON resources (emergency)")
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS resource_favorites (
-                user_id INTEGER NOT NULL,
-                resource_id TEXT NOT NULL,
-                favorited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, resource_id)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS screening_session_items (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    raw_score INTEGER,
+                    evidence TEXT,
+                    answered_at TIMESTAMPTZ,
+                    UNIQUE (session_id, item_id)
+                )
+                """
             )
-            """
-        )
 
-        # ---- suggested reply/action state (retrievable / dismissible) ----
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS suggested_states (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                conversation_id TEXT,
-                suggested_replies TEXT,
-                actions TEXT,
-                dismissed INTEGER NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ssi_session
+                ON screening_session_items (session_id)
+                """
             )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_suggested_user_conv ON suggested_states (user_id, conversation_id)"
-        )
 
-        # ---- pre-existing tables (unchanged schema, used for aggregates) ----
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS functional_impairments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                area TEXT NOT NULL,
-                severity TEXT NOT NULL,
-                evidence TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS screening_measurements (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id TEXT UNIQUE NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    assessment_type TEXT NOT NULL
+                        CHECK (
+                            assessment_type IN (
+                                'PHQ-9',
+                                'GAD-7',
+                                'PSS-10'
+                            )
+                        ),
+                    total INTEGER NOT NULL,
+                    completed_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_impair_user_ts ON functional_impairments (user_id, timestamp)"
-        )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sleep_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                hours REAL NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_measurement_user_time
+                ON screening_measurements (
+                    user_id,
+                    assessment_type,
+                    completed_at
+                )
+                """
             )
-            """
-        )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS weekly_summaries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                week_start TEXT NOT NULL,
-                week_end TEXT NOT NULL,
-                summary_text TEXT NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_measurement_user_completed
+                ON screening_measurements (
+                    user_id,
+                    completed_at
+                )
+                """
             )
-            """
-        )
-        _ensure_columns(
-            cur,
-            "weekly_summaries",
-            {
-                "phq9_avg": "REAL",
-                "gad7_avg": "REAL",
-                "pss10_avg": "REAL",
-                "interpretation": "TEXT",
-            },
-        )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS questionnaire_state (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                conversation_id TEXT,
-                session_id TEXT,
-                scale TEXT NOT NULL,
-                item_id INTEGER NOT NULL,
-                question_text TEXT NOT NULL,
-                evidence TEXT,
-                score INTEGER,
-                status TEXT NOT NULL DEFAULT 'pending',
-                asked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, scale, item_id)
+            # ---------------------------------------------------------
+            # DAILY CHECK-INS
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS check_ins (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    checkin_date TEXT NOT NULL,
+                    mood_score INTEGER,
+                    stress_score INTEGER,
+                    sleep_hours DOUBLE PRECISION,
+                    reflection TEXT,
+                    practice_type TEXT,
+                    source_conversation_id TEXT,
+                    created_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
-        _ensure_columns(
-            cur,
-            "questionnaire_state",
-            {
-                "conversation_id": "TEXT",
-                "session_id": "TEXT",
-                "evidence": "TEXT",
-                "score": "INTEGER",
-                "status": "TEXT NOT NULL DEFAULT 'pending'",
-                "updated_at": "TIMESTAMP",
-            },
-        )
-        cur.execute(
-            "UPDATE questionnaire_state SET status = 'pending' WHERE status IS NULL OR status = ''"
-        )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS risk_assessments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                risk_category TEXT NOT NULL,
-                phq9_total INTEGER,
-                gad7_total INTEGER,
-                pss10_total INTEGER,
-                trajectory TEXT,
-                emergency_flag INTEGER NOT NULL DEFAULT 0,
-                details TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_checkins_user_date
+                ON check_ins (user_id, checkin_date)
+                """
             )
-            """
-        )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS recommendation_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                category TEXT NOT NULL,
-                text TEXT NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_checkins_user_created
+                ON check_ins (user_id, created_at)
+                """
             )
-            """
-        )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS follow_ups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                scheduled_for TIMESTAMP NOT NULL,
-                note TEXT,
-                status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending','completed','cancelled')),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            # ---------------------------------------------------------
+            # USER PROFILE
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    user_id BIGINT PRIMARY KEY,
+                    display_name TEXT,
+                    preferred_language TEXT,
+                    theme TEXT,
+                    notification_prefs TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS escalation_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                trigger_message_id INTEGER,
-                counselor_summary TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'open'
-                    CHECK (status IN ('open','reviewed','closed')),
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            # ---------------------------------------------------------
+            # WELLBEING REPORTS
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS wellbeing_reports (
+                    id BIGSERIAL PRIMARY KEY,
+                    report_id TEXT UNIQUE NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    period_start TEXT NOT NULL,
+                    period_end TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_report_user
+                ON wellbeing_reports (user_id, created_at)
+                """
+            )
+
+            # ---------------------------------------------------------
+            # RESOURCES
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS resources (
+                    id BIGSERIAL PRIMARY KEY,
+                    resource_id TEXT UNIQUE NOT NULL,
+                    name TEXT NOT NULL,
+                    district TEXT,
+                    resource_type TEXT,
+                    services TEXT,
+                    availability TEXT,
+                    emergency INTEGER NOT NULL DEFAULT 0,
+                    contact_phone TEXT,
+                    contact_email TEXT,
+                    contact_name TEXT,
+                    address TEXT,
+                    directions TEXT,
+                    website TEXT,
+                    verified_source TEXT,
+                    source_url TEXT,
+                    verification_date TEXT,
+                    search_text TEXT
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_resources_district
+                ON resources (district)
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_resources_type
+                ON resources (resource_type)
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_resources_emergency
+                ON resources (emergency)
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS resource_favorites (
+                    user_id BIGINT NOT NULL,
+                    resource_id TEXT NOT NULL,
+                    favorited_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, resource_id)
+                )
+                """
+            )
+
+            # ---------------------------------------------------------
+            # SUGGESTED STATES
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS suggested_states (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    conversation_id TEXT,
+                    suggested_replies TEXT,
+                    actions TEXT,
+                    dismissed INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_suggested_user_conv
+                ON suggested_states (
+                    user_id,
+                    conversation_id
+                )
+                """
+            )
+
+            # ---------------------------------------------------------
+            # FUNCTIONAL IMPAIRMENTS
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS functional_impairments (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    area TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    evidence TEXT,
+                    timestamp TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_impair_user_ts
+                ON functional_impairments (
+                    user_id,
+                    timestamp
+                )
+                """
+            )
+
+            # ---------------------------------------------------------
+            # SLEEP REPORTS
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sleep_reports (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    hours DOUBLE PRECISION NOT NULL,
+                    timestamp TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            # ---------------------------------------------------------
+            # WEEKLY SUMMARIES
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS weekly_summaries (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    week_start TEXT NOT NULL,
+                    week_end TEXT NOT NULL,
+                    summary_text TEXT NOT NULL,
+                    phq9_avg DOUBLE PRECISION,
+                    gad7_avg DOUBLE PRECISION,
+                    pss10_avg DOUBLE PRECISION,
+                    interpretation TEXT,
+                    timestamp TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            # ---------------------------------------------------------
+            # QUESTIONNAIRE STATE
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS questionnaire_state (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    conversation_id TEXT,
+                    session_id TEXT,
+                    scale TEXT NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    question_text TEXT NOT NULL,
+                    evidence TEXT,
+                    score INTEGER,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    asked_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (user_id, scale, item_id)
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                UPDATE questionnaire_state
+                SET status = 'pending'
+                WHERE status IS NULL OR status = ''
+                """
+            )
+
+            # ---------------------------------------------------------
+            # RISK ASSESSMENTS
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS risk_assessments (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    risk_category TEXT NOT NULL,
+                    phq9_total INTEGER,
+                    gad7_total INTEGER,
+                    pss10_total INTEGER,
+                    trajectory TEXT,
+                    emergency_flag INTEGER NOT NULL DEFAULT 0,
+                    details TEXT,
+                    timestamp TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            # ---------------------------------------------------------
+            # RECOMMENDATIONS
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS recommendation_records (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    category TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    timestamp TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            # ---------------------------------------------------------
+            # FOLLOW UPS
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS follow_ups (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    scheduled_for TIMESTAMPTZ NOT NULL,
+                    note TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (
+                            status IN (
+                                'pending',
+                                'completed',
+                                'cancelled'
+                            )
+                        ),
+                    created_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            # ---------------------------------------------------------
+            # ESCALATIONS
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS escalation_records (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    trigger_message_id BIGINT,
+                    counselor_summary TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK (
+                            status IN (
+                                'open',
+                                'reviewed',
+                                'closed'
+                            )
+                        ),
+                    timestamp TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
 
         conn.commit()
 
@@ -962,20 +1178,21 @@ class ReportRequest(BaseModel):
     start: Optional[str] = None
     end: Optional[str] = None
 
-def _get_profile_sync(user_id: int) -> Optional[sqlite3.Row]:
+def _get_profile_sync(user_id: int) -> Optional[DatabaseRow]:
     with get_conn() as conn:
         return conn.execute(
             """
             SELECT
-                id,
-                username,
-                email_or_phone,
-                display_name,
-                preferred_language,
-                theme,
-                notification_prefs
-            FROM users
-            WHERE id=?
+                u.id,
+                u.username,
+                u.email,
+                p.display_name,
+                p.preferred_language,
+                p.theme,
+                p.notification_prefs
+            FROM users AS u
+            LEFT JOIN user_profiles AS p ON p.user_id = u.id
+            WHERE u.id=?
             """,
             (user_id,),
         ).fetchone()
@@ -1028,10 +1245,10 @@ def get_current_user_id(
         raise HTTPException(status_code=401, detail="Invalid or expired access token.")
 
 
-def get_current_user(user_id: int = Depends(get_current_user_id)) -> sqlite3.Row:
+def get_current_user(user_id: int = Depends(get_current_user_id)) -> DatabaseRow:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id, username, email_or_phone, created_at FROM users WHERE id = ?",
+            "SELECT id, username, email, created_at FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
     if row is None:
@@ -1083,7 +1300,7 @@ def _clamp_item_score(scale: str, raw_score: int) -> int:
 
 def _get_or_start_session_sync(
     user_id: int, conversation_id: Optional[str], scale: str
-) -> sqlite3.Row:
+) -> DatabaseRow:
     """Reuse or create ONE session per (user, scale, conversation).
 
     Starting a new session pauses any other active session so item scores from
@@ -1160,14 +1377,14 @@ def normalize_scale(value: str) -> str:
 
 async def get_or_start_screening_session(
     user_id: int, conversation_id: Optional[str], scale: str
-) -> sqlite3.Row:
+) -> DatabaseRow:
     scale = normalize_scale(scale)
     if scale not in VALID_SCALES:
         raise ValueError(f"Unsupported screening scale: {scale}")
     return await run_db(_get_or_start_session_sync, user_id, conversation_id, scale)
 
 
-def _active_screening_session_sync(user_id: int) -> Optional[sqlite3.Row]:
+def _active_screening_session_sync(user_id: int) -> Optional[DatabaseRow]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT * FROM screening_sessions WHERE user_id=? AND status='active' "
@@ -1176,7 +1393,7 @@ def _active_screening_session_sync(user_id: int) -> Optional[sqlite3.Row]:
         ).fetchone()
 
 
-def _get_owned_session_sync(user_id: int, session_id: str) -> Optional[sqlite3.Row]:
+def _get_owned_session_sync(user_id: int, session_id: str) -> Optional[DatabaseRow]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT * FROM screening_sessions WHERE user_id=? AND session_id=?",
@@ -1290,7 +1507,7 @@ async def cancel_active_sessions(user_id: int) -> None:
     await run_db(_cancel_active_sessions_sync, user_id)
 
 
-def _session_items_sync(session_id: str) -> List[sqlite3.Row]:
+def _session_items_sync(session_id: str) -> List[DatabaseRow]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT item_id, raw_score, evidence, answered_at FROM screening_session_items "
@@ -1299,7 +1516,7 @@ def _session_items_sync(session_id: str) -> List[sqlite3.Row]:
         ).fetchall()
 
 
-async def get_session_items(session_id: str) -> List[sqlite3.Row]:
+async def get_session_items(session_id: str) -> List[DatabaseRow]:
     return await run_db(_session_items_sync, session_id)
 
 
@@ -1336,7 +1553,7 @@ async def get_latest_finalized_totals(user_id: int) -> Dict[str, Optional[int]]:
     return await run_db(_latest_finalized_totals_sync, user_id)
 
 
-def _measurement_history_sync(user_id: int, scale: str, limit: int = 2) -> List[sqlite3.Row]:
+def _measurement_history_sync(user_id: int, scale: str, limit: int = 2) -> List[DatabaseRow]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT total, completed_at FROM screening_measurements "
@@ -1345,7 +1562,7 @@ def _measurement_history_sync(user_id: int, scale: str, limit: int = 2) -> List[
         ).fetchall()
 
 
-async def measurement_history(user_id: int, scale: str, limit: int = 2) -> List[sqlite3.Row]:
+async def measurement_history(user_id: int, scale: str, limit: int = 2) -> List[DatabaseRow]:
     return await run_db(_measurement_history_sync, user_id, scale, limit)
 
 
@@ -1489,11 +1706,12 @@ def get_risk_details(
 def _save_message_sync(user_id, role, content, conversation_id=None) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO conversation_messages (user_id, role, content, conversation_id) VALUES (?,?,?,?)",
+            "INSERT INTO conversation_messages (user_id, role, content, conversation_id) VALUES (?,?,?,?) RETURNING id",
             (user_id, role, content, conversation_id),
         )
+        message_id = cur.fetchone()["id"]
         conn.commit()
-        return cur.lastrowid
+        return int(message_id)
 
 
 async def save_message(
@@ -1526,7 +1744,7 @@ async def create_conversation(user_id: int) -> str:
     return await run_db(_create_conversation_sync, user_id)
 
 
-def _verify_conversation_sync(user_id: int, conversation_id: str) -> Optional[sqlite3.Row]:
+def _verify_conversation_sync(user_id: int, conversation_id: str) -> Optional[DatabaseRow]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT conversation_id FROM conversations WHERE user_id=? AND conversation_id=?",
@@ -1534,11 +1752,11 @@ def _verify_conversation_sync(user_id: int, conversation_id: str) -> Optional[sq
         ).fetchone()
 
 
-async def verify_conversation(user_id: int, conversation_id: str) -> Optional[sqlite3.Row]:
+async def verify_conversation(user_id: int, conversation_id: str) -> Optional[DatabaseRow]:
     return await run_db(_verify_conversation_sync, user_id, conversation_id)
 
 
-def _recent_messages_sync(user_id, limit, conversation_id=None) -> List[sqlite3.Row]:
+def _recent_messages_sync(user_id, limit, conversation_id=None) -> List[DatabaseRow]:
     with get_conn() as conn:
         if conversation_id is not None:
             rows = conn.execute(
@@ -1561,7 +1779,7 @@ async def get_recent_messages(user_id, limit=MAX_RECENT_MESSAGES, conversation_i
 
 # --- new chat retrieval (section G) -------------------------------------------
 
-def _own_conversations_sync(user_id: int) -> List[sqlite3.Row]:
+def _own_conversations_sync(user_id: int) -> List[DatabaseRow]:
     with get_conn() as conn:
         return conn.execute(
             """
@@ -1590,7 +1808,7 @@ def _last_preview_sync(user_id: int, conversation_id: str) -> str:
 
 def _conversation_messages_sync(
     user_id: int, conversation_id: str, limit: int, before_id: Optional[int]
-) -> List[sqlite3.Row]:
+) -> List[DatabaseRow]:
     with get_conn() as conn:
         if before_id:
             rows = conn.execute(
@@ -1608,7 +1826,7 @@ def _conversation_messages_sync(
     return list(reversed(rows))
 
 
-def _suggested_state_sync(user_id: int) -> Optional[sqlite3.Row]:
+def _suggested_state_sync(user_id: int) -> Optional[DatabaseRow]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT * FROM suggested_states WHERE user_id=? AND dismissed=0 "
@@ -1857,13 +2075,14 @@ def _store_weekly_summary_sync(
         )
         cur = conn.execute(
             "INSERT INTO weekly_summaries (user_id, week_start, week_end, summary_text, phq9_avg, gad7_avg, pss10_avg, interpretation) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?) RETURNING id",
             (user_id, week_start, week_end, summary_text,
              averages.get("PHQ-9"), averages.get("GAD-7"), averages.get("PSS-10"),
              json.dumps(interpretation or {})),
         )
+        summary_id = cur.fetchone()["id"]
         conn.commit()
-        return cur.lastrowid
+        return int(summary_id)
 
 
 def _resolve_week(week_start=None, week_end=None) -> tuple[str, str]:
@@ -1933,7 +2152,7 @@ def build_weekly_aggregate(averages: dict) -> WeeklyAggregate:
         pss10_avg=averages.get("PSS-10"),
         interpretation=interpretation,
     )
-def _recent_weekly_summaries_sync(user_id: int, weeks: int = 4) -> List[sqlite3.Row]:
+def _recent_weekly_summaries_sync(user_id: int, weeks: int = 4) -> List[DatabaseRow]:
     with get_conn() as conn:
         return conn.execute(
             """
@@ -1950,10 +2169,10 @@ def _recent_weekly_summaries_sync(user_id: int, weeks: int = 4) -> List[sqlite3.
 
 async def get_recent_weekly_summaries(
     user_id: int, weeks: int = 4
-) -> List[sqlite3.Row]:
+) -> List[DatabaseRow]:
     return await run_db(_recent_weekly_summaries_sync, user_id, weeks)
 
-def _weekly_history_sync(user_id: int, weeks: int) -> List[sqlite3.Row]:
+def _weekly_history_sync(user_id: int, weeks: int) -> List[DatabaseRow]:
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT week_start, week_end, phq9_avg, gad7_avg, pss10_avg FROM weekly_summaries "
@@ -2050,7 +2269,7 @@ async def save_risk_assessment(user_id, details, totals) -> None:
     await run_db(_save_risk_assessment_sync, user_id, details, totals)
 
 
-def _previous_totals_sync(user_id: int) -> Optional[sqlite3.Row]:
+def _previous_totals_sync(user_id: int) -> Optional[DatabaseRow]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT phq9_total, gad7_total, pss10_total FROM risk_assessments "
@@ -2066,11 +2285,12 @@ def _save_risk_assessment_sync(user_id, details, totals):
 def _create_escalation_sync(user_id, summary, trigger_message_id) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO escalation_records (user_id, trigger_message_id, counselor_summary, status) VALUES (?,?,?,'open')",
+            "INSERT INTO escalation_records (user_id, trigger_message_id, counselor_summary, status) VALUES (?,?,?,'open') RETURNING id",
             (user_id, trigger_message_id, summary),
         )
+        escalation_id = cur.fetchone()["id"]
         conn.commit()
-        return cur.lastrowid
+        return int(escalation_id)
 
 
 async def create_escalation(user_id, summary, counselor_message_id=None) -> int:
@@ -2087,18 +2307,19 @@ RECOMMENDATION_DISCLAIMER = "Supportive suggestion only - not medical advice, di
 def _store_recommendation_sync(user_id, category, text) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO recommendation_records (user_id, category, text) VALUES (?,?,?)",
+            "INSERT INTO recommendation_records (user_id, category, text) VALUES (?,?,?) RETURNING id",
             (user_id, category, text),
         )
+        recommendation_id = cur.fetchone()["id"]
         conn.commit()
-        return cur.lastrowid
+        return int(recommendation_id)
 
 
 async def store_recommendation(user_id, category, text) -> int:
     return await run_db(_store_recommendation_sync, user_id, category, text)
 
 
-def _list_recommendations_sync(user_id, limit) -> List[sqlite3.Row]:
+def _list_recommendations_sync(user_id, limit) -> List[DatabaseRow]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT id, category, text, timestamp FROM recommendation_records WHERE user_id=? ORDER BY id DESC LIMIT ?",
@@ -2106,7 +2327,7 @@ def _list_recommendations_sync(user_id, limit) -> List[sqlite3.Row]:
         ).fetchall()
 
 
-async def list_recommendations(user_id, limit=50) -> List[sqlite3.Row]:
+async def list_recommendations(user_id, limit=50) -> List[DatabaseRow]:
     return await run_db(_list_recommendations_sync, user_id, limit)
 
 
@@ -2116,7 +2337,7 @@ build_recommendations = (
 )
 
 
-def _recommendations_in_window_sync(user_id: int, start: str, end: str) -> List[sqlite3.Row]:
+def _recommendations_in_window_sync(user_id: int, start: str, end: str) -> List[DatabaseRow]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT id, category, text, timestamp FROM recommendation_records "
@@ -2494,16 +2715,15 @@ async def update_profile(
         values.append(json.dumps(data.notification_prefs))
 
     if updates:
-        values.append(user_id)
-
         with get_conn() as conn:
             conn.execute(
                 f"""
-                UPDATE users
-                SET {", ".join(updates)}
-                WHERE id=?
+                INSERT INTO user_profiles (user_id, {", ".join(item.split("=")[0] for item in updates)})
+                VALUES (?, {", ".join("?" for _ in values)})
+                ON CONFLICT (user_id) DO UPDATE
+                SET {", ".join(updates)}, updated_at=CURRENT_TIMESTAMP
                 """,
-                values,
+                [user_id, *values],
             )
             conn.commit()
 
