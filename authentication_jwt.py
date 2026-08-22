@@ -706,7 +706,8 @@ def register(data: RegisterRequest):
         cursor.execute(
             """
             INSERT INTO users (username, email, password, is_verified)
-            VALUES (%s, %s, %s, False)
+            VALUES (%s, %s, %s, FALSE)
+            RETURNING id
             """,
             (
                 username,
