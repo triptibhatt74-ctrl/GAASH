@@ -1716,22 +1716,40 @@ def _last_preview_sync(user_id: int, conversation_id: str) -> str:
 
 
 def _conversation_messages_sync(
-    user_id: int, conversation_id: str, limit: int, before_id: Optional[int]
+    user_id: int,
+    conversation_id: str,
+    limit: int = 100,
+    before_id: Optional[int] = None,
 ) -> List[DatabaseRow]:
+
     with get_conn() as conn:
-        if before_id:
+        if before_id is not None:
             rows = conn.execute(
-                "SELECT id, role, content, timestamp FROM conversation_messages "
-                "WHERE user_id=? AND conversation_id=? AND id < ? "
-                "ORDER BY id DESC LIMIT ?",
+                """
+                SELECT id, role, content, timestamp
+                FROM conversation_messages
+                WHERE user_id = %s
+                  AND conversation_id = %s
+                  AND id < %s
+                ORDER BY id DESC
+                LIMIT %s
+                """,
                 (user_id, conversation_id, before_id, limit),
             ).fetchall()
+
         else:
             rows = conn.execute(
-                "SELECT id, role, content, timestamp FROM conversation_messages "
-                "WHERE user_id=? AND conversation_id=? ORDER BY id DESC LIMIT ?",
+                """
+                SELECT id, role, content, timestamp
+                FROM conversation_messages
+                WHERE user_id = %s
+                  AND conversation_id = %s
+                ORDER BY id DESC
+                LIMIT %s
+                """,
                 (user_id, conversation_id, limit),
             ).fetchall()
+
     return list(reversed(rows))
 
 
@@ -2894,6 +2912,8 @@ async def get_conversations(
 @app.get("/conversations/{conversation_id}")
 async def get_conversation(
     conversation_id: str,
+    limit: int = 100,
+    before_id: Optional[int] = None,
     user_id: int = Depends(get_current_user_id),
 ):
     conversation = await verify_conversation(
@@ -2904,13 +2924,15 @@ async def get_conversation(
     if conversation is None:
         raise HTTPException(
             status_code=404,
-            detail="Conversation not found."
+            detail="Conversation not found.",
         )
 
     rows = await run_db(
         _conversation_messages_sync,
         user_id,
         conversation_id,
+        limit,
+        before_id,
     )
 
     return {
@@ -2918,9 +2940,8 @@ async def get_conversation(
         "messages": [
             dict(row)
             for row in rows
-        ]
+        ],
     }
-
 
 # ---------------------------------------------------------------------------
 # ASSESSMENTS
