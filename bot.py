@@ -3604,16 +3604,44 @@ async def pause_screening(
     http_request: Request,
     user_id: int = Depends(get_current_user_id),
 ):
-    enforce_rate_limit(http_request, "screening-pause", limit=30, window_seconds=600)
+    enforce_rate_limit(
+        http_request,
+        "screening-pause",
+        limit=30,
+        window_seconds=600,
+    )
+
+    session = await run_db(
+        _get_owned_session_sync,
+        user_id,
+        session_id,
+    )
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found.",
+        )
+
+    current_status = session["status"]
+
+    if current_status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Session is {current_status} and cannot be paused.",
+        )
+
     success = await pause_session(
         user_id,
         session_id,
     )
 
     if not success:
+        # Covers a rare race where session state changed between
+        # checking it and updating it.
         raise HTTPException(
-            status_code=404,
-            detail="Session not found."
+            status_code=409,
+            detail="Session state changed and could not be paused.",
         )
 
     return {
