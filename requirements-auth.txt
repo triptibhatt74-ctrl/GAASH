@@ -1,8 +1,7 @@
-fastapi
-uvicorn[standard]
-pydantic
-python-dotenv
-PyJWT
-resend
-requests
-psycopg[binary]
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+pydantic>=2.6,<3.0
+python-dotenv>=1.0,<2.0
+PyJWT>=2.8,<3.0
+resend>=2.0,<3.0
+psycopg[binary]>=3.1,<4.0

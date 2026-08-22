@@ -2,11 +2,17 @@ import contextlib
 import hashlib
 import hmac
 import html
+import logging
 import os
 
 import secrets
 import smtplib
+import threading
+import time
 import psycopg
+from psycopg import errors as pg_errors
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -16,33 +22,43 @@ import jwt
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 
 load_dotenv()
+logger = logging.getLogger("gaash.auth")
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    yield
+
+
 app = FastAPI(
     title="Gaash Authentication API",
     description="Authentication and account-management backend for Gaash",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 # AUTH_HOST/AUTH_PORT let both services share one .env without colliding with bot.py's HOST/PORT.
 HOST = os.getenv("AUTH_HOST") or os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("AUTH_PORT") or os.getenv("PORT", "8004"))
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://gaashai_db_user:n5zReAPcVTqeNzzbbt7MLwcw0giuJEZk@dpg-da4k1sk9v7es738e8450-a.ohio-postgres.render.com/gaashai_db").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not configured.")
 
-JWT_SECRET = os.getenv("GAASH_JWT_SECRET", "CHANGE_THIS_IN_PRODUCTION")
+JWT_SECRET = os.getenv("GAASH_JWT_SECRET", "").strip()
+if not JWT_SECRET:
+    raise RuntimeError("GAASH_JWT_SECRET is not configured.")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
@@ -66,22 +82,48 @@ RESEND_FROM_EMAIL = os.getenv(
 ).strip()
 
 
+_DEFAULT_CORS_ORIGINS = (
+    "http://localhost:3000,http://127.0.0.1:3000,"
+    "http://localhost:5173,http://127.0.0.1:5173,"
+    "http://localhost:5174,http://127.0.0.1:5174"
+)
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", _DEFAULT_CORS_ORIGINS).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-    ],
+    allow_origins=CORS_ORIGINS,
+    # Authentication uses Authorization headers, not cross-site cookies.
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 security = HTTPBearer(auto_error=False)
+
+_RATE_LIMIT_BUCKETS: dict[tuple[str, str], list[float]] = {}
+_RATE_LIMIT_LOCK = threading.Lock()
+
+
+def enforce_rate_limit(request: Request, scope: str, limit: int, window_seconds: int) -> None:
+    """Apply a small process-local guard without recording account identifiers."""
+    client = request.client.host if request.client else "unknown"
+    key = (scope, client)
+    now = time.monotonic()
+    with _RATE_LIMIT_LOCK:
+        attempts = [started for started in _RATE_LIMIT_BUCKETS.get(key, []) if now - started < window_seconds]
+        if len(attempts) >= limit:
+            retry_after = max(1, int(window_seconds - (now - attempts[0])) + 1)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Please wait before trying again.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        attempts.append(now)
+        _RATE_LIMIT_BUCKETS[key] = attempts
 
 
 class OTPServiceError(Exception):
@@ -94,13 +136,6 @@ class OTPServiceError(Exception):
 
 def get_connection():
     return psycopg.connect(DATABASE_URL)
-
-
-def _ensure_columns(conn: psycopg.Connection, table: str, columns: dict) -> None:
-    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-    for name, ddl in columns.items():
-        if name not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
 def init_db() -> None:
@@ -162,6 +197,16 @@ def init_db() -> None:
                 """
             )
 
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS revoked_access_tokens (
+                    token_hash TEXT PRIMARY KEY,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    revoked_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
         conn.commit()
 
 
@@ -209,6 +254,46 @@ def hash_otp(otp: str) -> str:
 def hash_reset_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
+
+def hash_access_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def is_access_token_revoked(token: str) -> bool:
+    with contextlib.closing(get_connection()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM revoked_access_tokens WHERE token_hash = %s AND expires_at > CURRENT_TIMESTAMP",
+                (hash_access_token(token),),
+            )
+            return cur.fetchone() is not None
+
+
+def revoke_access_token(token: str) -> None:
+    """Record a validated access token as revoked until its normal expiry."""
+    payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    expires_at = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
+    with contextlib.closing(get_connection()) as conn:
+        with conn.cursor() as cur:
+            # Opportunistically discard no-longer-relevant revocations.
+            cur.execute("DELETE FROM revoked_access_tokens WHERE expires_at <= CURRENT_TIMESTAMP")
+            cur.execute(
+                """
+                INSERT INTO revoked_access_tokens (token_hash, expires_at)
+                VALUES (%s, %s)
+                ON CONFLICT (token_hash) DO NOTHING
+                """,
+                (hash_access_token(token), expires_at),
+            )
+        conn.commit()
+
+
+def as_utc_datetime(value: datetime | str) -> datetime:
+    """Normalise Psycopg timestamps and string timestamps before comparison."""
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
 def normalize_email(value: str) -> str:
     return value.strip().lower()
 
@@ -237,6 +322,12 @@ def _lookup_user_by_email(
             (email,),
         )
         return cur.fetchone()
+
+
+def lock_user_for_otp(conn, user_id: int) -> None:
+    """Serialize OTP replacement for one account within the current transaction."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
 
 def create_access_token(user_id: int, gaash_id: str) -> str:
     now = datetime.now(timezone.utc)
@@ -284,9 +375,6 @@ def store_reset_token(conn, user_id: int, token: str) -> None:
             """,
             (user_id, token_hash, expires_at),
         )
-
-    conn.commit()
-
 
 def numeric_gaash_id(gaash_id: str) -> int:
     if not gaash_id.startswith("GSH-"):
@@ -364,7 +452,7 @@ def _send_email_via_resend(recipient: str, otp: str, purpose: str) -> None:
     try:
         response = resend.Emails.send(params)
     except Exception as exc:
-        print("RESEND ERROR:", repr(exc))
+        logger.warning("Resend delivery failed: %s", type(exc).__name__)
         raise OTPServiceError("Could not send email via Resend.") from exc
 
     email_id = response.get("id") if isinstance(response, dict) else getattr(response, "id", None)
@@ -437,6 +525,7 @@ def verify_and_consume_otp(
               AND purpose = %s
             ORDER BY id DESC
             LIMIT 1
+            FOR UPDATE
             """,
             (user_id, email, purpose),
         )
@@ -463,7 +552,6 @@ def verify_and_consume_otp(
                 """,
                 (otp_id,),
             )
-            conn.commit()
             return False
 
         if attempts >= MAX_OTP_ATTEMPTS:
@@ -475,7 +563,6 @@ def verify_and_consume_otp(
                 """,
                 (otp_id,),
             )
-            conn.commit()
             return False
 
         cur.execute(
@@ -491,7 +578,6 @@ def verify_and_consume_otp(
             stored_hash,
             hash_otp(otp),
         ):
-            conn.commit()
             return False
 
         cur.execute(
@@ -503,7 +589,6 @@ def verify_and_consume_otp(
             (otp_id,),
         )
 
-    conn.commit()
     return True
 
 
@@ -538,12 +623,23 @@ def get_current_user_id(
             detail="Invalid or expired access token.",
         )
 
+    if is_access_token_revoked(credentials.credentials):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired access token.",
+        )
     return user_id
 
 
-def get_reset_user_id(
+@dataclass(frozen=True)
+class ResetTokenContext:
+    user_id: int
+    token_hash: str
+
+
+def get_reset_token_context(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-) -> int:
+) -> ResetTokenContext:
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -571,7 +667,7 @@ def get_reset_user_id(
     with contextlib.closing(get_connection()) as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, user_id, used, expires_at FROM reset_tokens WHERE token_hash = %s",
+            "SELECT id, user_id, used, expires_at FROM reset_tokens WHERE token_hash = %s FOR UPDATE",
             (token_hash,),
         )
         row = cur.fetchone()
@@ -594,10 +690,8 @@ def get_reset_user_id(
             )
 
         try:
-            expiry = datetime.fromisoformat(expires_at)
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=timezone.utc)
-        except ValueError:
+            expiry = as_utc_datetime(expires_at)
+        except (TypeError, ValueError):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or expired reset token.",
@@ -609,13 +703,7 @@ def get_reset_user_id(
                 detail="Invalid or expired reset token.",
             )
 
-        cur.execute(
-            "UPDATE reset_tokens SET used = True WHERE id = %s",
-            (record_id,),
-        )
-        conn.commit()
-
-    return user_id
+    return ResetTokenContext(user_id=user_id, token_hash=token_hash)
 
 
 # ============================================================
@@ -651,6 +739,35 @@ class ResetPasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=8, max_length=100)
 
 
+class AuthMessageResponse(BaseModel):
+    message: str
+    status: Optional[str] = None
+
+
+class SafeUserResponse(BaseModel):
+    user_id: int
+    gaash_id: str
+    username: str
+    email: str
+
+
+class AuthTokenResponse(BaseModel):
+    message: str
+    access_token: str
+    token_type: str
+    user: SafeUserResponse
+    next_step: str
+
+
+class ResetTokenResponse(BaseModel):
+    message: str
+    reset_token: str
+
+
+class CurrentUserResponse(SafeUserResponse):
+    created_at: datetime
+
+
 # ============================================================
 # ROUTES
 # ============================================================
@@ -669,11 +786,14 @@ def health():
     return {"status": "ok", "service": "Gaash Authentication API"}
 
 
-@app.post("/auth/register")
-def register(data: RegisterRequest):
+@app.post("/auth/register", response_model=AuthMessageResponse)
+def register(data: RegisterRequest, request: Request):
+    enforce_rate_limit(request, "register", limit=5, window_seconds=600)
     username = data.username.strip()
     email = normalize_email(data.email)
 
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Username must contain at least 3 characters.")
     if not is_email_address(email):
         raise HTTPException(
             status_code=400,
@@ -703,26 +823,30 @@ def register(data: RegisterRequest):
                 detail="Email is already registered.",
             )
 
-        cursor.execute(
-            """
-            INSERT INTO users (username, email, password, is_verified)
-            VALUES (%s, %s, %s, FALSE)
-            RETURNING id
-            """,
-            (
-                username,
-                email,
-                hash_password(data.password),
-            ),
-        )
+        try:
+            cursor.execute(
+                """
+                INSERT INTO users (username, email, password, is_verified)
+                VALUES (%s, %s, %s, FALSE)
+                RETURNING id
+                """,
+                (
+                    username,
+                    email,
+                    hash_password(data.password),
+                ),
+            )
+        except pg_errors.UniqueViolation as exc:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail="Username or email is already registered.") from exc
 
         user_id = cursor.fetchone()[0]
 
         cursor.execute(
             """
             UPDATE otp_verifications
-            SET used = True
-            WHERE user_id = %s AND purpose = 'REGISTRATION' AND used = False
+            SET used = TRUE
+            WHERE user_id = %s AND purpose = 'REGISTRATION' AND used = FALSE
             """,
             (user_id,),
         )
@@ -753,8 +877,9 @@ def register(data: RegisterRequest):
 
 
 
-@app.post("/auth/verify-registration")
-def verify_registration(data: VerifyRegistrationRequest):
+@app.post("/auth/verify-registration", response_model=AuthMessageResponse)
+def verify_registration(data: VerifyRegistrationRequest, request: Request):
+    enforce_rate_limit(request, "verify-registration", limit=10, window_seconds=600)
     email = normalize_email(data.email)
     if not is_email_address(email):
         raise HTTPException(status_code=400, detail="Please provide a valid email address.")
@@ -771,26 +896,30 @@ def verify_registration(data: VerifyRegistrationRequest):
         user_id = user[0]
         email = user[2]
 
+        lock_user_for_otp(conn, user_id)
+
         if user[4]:
             raise HTTPException(
                 status_code=400,
                 detail="Account is already verified.",
             )
 
-        if not verify_and_consume_otp(
+        verified = verify_and_consume_otp(
             conn,
             user_id,
             email,
             "REGISTRATION",
             data.otp,
-        ):
+        )
+        if not verified:
+            conn.commit()
             raise HTTPException(
                 status_code=400,
                 detail="Invalid or expired verification code.",
             )
 
         conn.execute(
-            "UPDATE users SET is_verified = True WHERE id = %s",
+            "UPDATE users SET is_verified = TRUE WHERE id = %s",
             (user_id,),
         )
         conn.commit()
@@ -800,8 +929,9 @@ def verify_registration(data: VerifyRegistrationRequest):
     }
 
 
-@app.post("/auth/resend-otp")
-def resend_otp(data: RequestOTPRequest):
+@app.post("/auth/resend-otp", response_model=AuthMessageResponse)
+def resend_otp(data: RequestOTPRequest, request: Request):
+    enforce_rate_limit(request, "resend-registration-otp", limit=3, window_seconds=600)
     email = normalize_email(data.email)
     generic_response = {
         "message": "If your account is eligible, a new verification code has been sent."
@@ -816,6 +946,8 @@ def resend_otp(data: RequestOTPRequest):
         user_id = user[0]
         email = user[2]
 
+        lock_user_for_otp(conn, user_id)
+
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -823,7 +955,7 @@ def resend_otp(data: RequestOTPRequest):
             FROM otp_verifications
             WHERE user_id = %s
               AND purpose = 'REGISTRATION'
-              AND used = False
+              AND used = FALSE
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -833,9 +965,7 @@ def resend_otp(data: RequestOTPRequest):
         row = cursor.fetchone()
 
         if row:
-            last_sent = datetime.fromisoformat(row[0])
-            if last_sent.tzinfo is None:
-                last_sent = last_sent.replace(tzinfo=timezone.utc)
+            last_sent = as_utc_datetime(row[0])
 
             elapsed = (
                 datetime.now(timezone.utc) - last_sent
@@ -850,10 +980,10 @@ def resend_otp(data: RequestOTPRequest):
         cursor.execute(
             """
             UPDATE otp_verifications
-            SET used = True
+            SET used = TRUE
             WHERE user_id = %s
-              AND purpose = 'REGISTRATION'
-              AND used = 0
+               AND purpose = 'REGISTRATION'
+               AND used = FALSE
             """,
             (user_id,),
         )
@@ -874,8 +1004,9 @@ def resend_otp(data: RequestOTPRequest):
     return generic_response
 
 
-@app.post("/auth/login")
-def login(data: LoginRequest):
+@app.post("/auth/login", response_model=AuthTokenResponse)
+def login(data: LoginRequest, request: Request):
+    enforce_rate_limit(request, "login", limit=10, window_seconds=600)
     email = normalize_email(data.email)
     if not is_email_address(email):
         raise HTTPException(status_code=400, detail="Please provide a valid email address.")
@@ -913,8 +1044,9 @@ def login(data: LoginRequest):
     }
 
 
-@app.post("/auth/forgot-password")
-def forgot_password(data: RequestOTPRequest):
+@app.post("/auth/forgot-password", response_model=AuthMessageResponse)
+def forgot_password(data: RequestOTPRequest, request: Request):
+    enforce_rate_limit(request, "forgot-password", limit=3, window_seconds=600)
     generic_response = {
         "message": "If an account exists for this email, a verification code has been sent to that email."
     }
@@ -926,6 +1058,8 @@ def forgot_password(data: RequestOTPRequest):
             return generic_response
 
         user_id, registered_email = user[0], user[2]
+
+        lock_user_for_otp(conn, user_id)
 
         conn.execute(
             """
@@ -965,8 +1099,9 @@ def forgot_password(data: RequestOTPRequest):
     return generic_response
 
 
-@app.post("/auth/verify-reset-otp")
-def verify_reset_otp(data: VerifyResetOTPRequest):
+@app.post("/auth/verify-reset-otp", response_model=ResetTokenResponse)
+def verify_reset_otp(data: VerifyResetOTPRequest, request: Request):
+    enforce_rate_limit(request, "verify-reset-otp", limit=10, window_seconds=600)
     email = normalize_email(data.email)
     if not is_email_address(email):
         raise HTTPException(status_code=400, detail="Please provide a valid email address.")
@@ -980,14 +1115,23 @@ def verify_reset_otp(data: VerifyResetOTPRequest):
             )
 
         user_id, registered_contact = user[0], user[2]
-        if not verify_and_consume_otp(conn, user_id, registered_contact, "PASSWORD_RESET", data.otp):
+        lock_user_for_otp(conn, user_id)
+        verified = verify_and_consume_otp(conn, user_id, registered_contact, "PASSWORD_RESET", data.otp)
+        if not verified:
+            conn.commit()
             raise HTTPException(
                 status_code=400,
                 detail="Invalid or expired reset code.",
             )
 
+        # A new reset grant supersedes any previously issued reset credential.
+        conn.execute(
+            "UPDATE reset_tokens SET used = TRUE WHERE user_id = %s AND used = FALSE",
+            (user_id,),
+        )
         reset_token = create_password_reset_token(user_id)
         store_reset_token(conn, user_id, reset_token)
+        conn.commit()
 
     return {
         "message": "Verification successful.",
@@ -995,16 +1139,51 @@ def verify_reset_otp(data: VerifyResetOTPRequest):
     }
 
 
-@app.post("/auth/reset-password")
+@app.post("/auth/reset-password", response_model=AuthMessageResponse)
 def reset_password(
     data: ResetPasswordRequest,
-    user_id: int = Depends(get_reset_user_id),
+    request: Request,
+    reset_context: ResetTokenContext = Depends(get_reset_token_context),
 ):
+    enforce_rate_limit(request, "reset-password", limit=5, window_seconds=600)
     with contextlib.closing(get_connection()) as conn:
-        conn.execute(
-            "UPDATE users SET password = %s WHERE id = %s",
-            (hash_password(data.new_password), user_id),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT user_id
+                FROM reset_tokens
+                WHERE token_hash = %s
+                  AND user_id = %s
+                  AND used = FALSE
+                  AND expires_at > CURRENT_TIMESTAMP
+                FOR UPDATE
+                """,
+                (reset_context.token_hash, reset_context.user_id),
+            )
+            if cur.fetchone() is None:
+                conn.rollback()
+                raise HTTPException(status_code=401, detail="Invalid or expired reset token.")
+            cur.execute(
+                "UPDATE users SET password = %s WHERE id = %s",
+                (hash_password(data.new_password), reset_context.user_id),
+            )
+            cur.execute(
+                """
+                UPDATE reset_tokens
+                SET used = TRUE
+                WHERE token_hash = %s AND user_id = %s AND used = FALSE
+                """,
+                (reset_context.token_hash, reset_context.user_id),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                raise HTTPException(status_code=401, detail="Invalid or expired reset token.")
+            # A successful reset makes every outstanding reset credential for
+            # the account unusable, not only the one presented here.
+            cur.execute(
+                "UPDATE reset_tokens SET used = TRUE WHERE user_id = %s AND used = FALSE",
+                (reset_context.user_id,),
+            )
         conn.commit()
 
     return {
@@ -1012,7 +1191,20 @@ def reset_password(
     }
 
 
-@app.get("/me")
+@app.post("/auth/logout", response_model=AuthMessageResponse)
+def logout(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    _: int = Depends(get_current_user_id),
+):
+    enforce_rate_limit(request, "logout", limit=20, window_seconds=600)
+    # The dependency has already validated the bearer scheme, purpose, expiry,
+    # signature, and user association before this revocation is persisted.
+    revoke_access_token(credentials.credentials)
+    return {"message": "Signed out."}
+
+
+@app.get("/me", response_model=CurrentUserResponse)
 def get_current_user(user_id: int = Depends(get_current_user_id)):
     with contextlib.closing(get_connection()) as conn:
         cursor = conn.cursor()
@@ -1038,7 +1230,7 @@ def get_current_user(user_id: int = Depends(get_current_user_id)):
     }
 
 
-@app.get("/user/{gaash_id}")
+@app.get("/user/{gaash_id}", response_model=CurrentUserResponse)
 def get_user(
     gaash_id: str,
     user_id: int = Depends(get_current_user_id),
@@ -1057,8 +1249,6 @@ def get_user(
 # ============================================================
 # START SERVER
 # ============================================================
-
-init_db()
 
 if __name__ == "__main__":
     uvicorn.run(app, host=HOST, port=PORT, reload=False)
