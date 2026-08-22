@@ -1793,14 +1793,37 @@ async def get_latest_measurements(user_id: int) -> List[DatabaseRow]:
     return await run_db(_latest_measurements_sync, user_id)
 
 
-def _measurement_history_sync(user_id: int, scale: str, limit: int, before_id: Optional[int]) -> List[DatabaseRow]:
+def _measurement_history_sync(
+    user_id: int,
+    scale: str,
+    limit: int,
+    before_id: Optional[int],
+) -> List[DatabaseRow]:
     with get_conn() as conn:
+        if before_id is not None:
+            return conn.execute(
+                """
+                SELECT id, total, completed_at
+                FROM screening_measurements
+                WHERE user_id = %s
+                  AND assessment_type = %s
+                  AND id < %s
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (user_id, scale, before_id, limit),
+            ).fetchall()
+
         return conn.execute(
-            "SELECT id, total, completed_at FROM screening_measurements "
-            "WHERE user_id=%s AND assessment_type=%s "
-            "AND (%s IS NULL OR id < %s) "
-            "ORDER BY id DESC LIMIT %s",
-            (user_id, scale, before_id, before_id, limit),
+            """
+            SELECT id, total, completed_at
+            FROM screening_measurements
+            WHERE user_id = %s
+              AND assessment_type = %s
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (user_id, scale, limit),
         ).fetchall()
 
 
