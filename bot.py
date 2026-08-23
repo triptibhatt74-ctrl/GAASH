@@ -3243,7 +3243,7 @@ def _update_profile_sync(user_id: int, updates: List[str], values: List[Any]) ->
             ON CONFLICT (user_id) DO UPDATE
             SET {", ".join(updates)}, updated_at=CURRENT_TIMESTAMP
             """,
-            [user_id, *values],
+            [user_id, *values, *values],
         )
         conn.commit()
 
