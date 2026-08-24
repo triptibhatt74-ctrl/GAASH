@@ -3050,38 +3050,56 @@ def _get_other_conversation_summaries_sync(
     current_conversation_id: Optional[str],
     limit: int,
 ) -> List[DatabaseRow]:
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                cs.conversation_id,
-                cs.summary_text,
-                cs.updated_at
-            FROM conversation_summaries cs
-            JOIN conversations c
-                ON c.conversation_id = cs.conversation_id
-            WHERE c.user_id = %s
-              AND cs.summary_text IS NOT NULL
-              AND TRIM(cs.summary_text) <> ''
-              AND (
-                    %s IS NULL
-                    OR cs.conversation_id <> %s
-                  )
-            ORDER BY cs.updated_at DESC
-            LIMIT %s
-            """,
-            (
-                user_id,
-                current_conversation_id,
-                current_conversation_id,
-                limit,
-            ),
-        ).fetchall()
 
-    return [
-        dict(row)
-        for row in rows
-    ]
+    with get_conn() as conn:
+
+        if current_conversation_id:
+            rows = conn.execute(
+                """
+                SELECT
+                    cs.conversation_id,
+                    cs.summary_text,
+                    cs.updated_at
+                FROM conversation_summaries cs
+                JOIN conversations c
+                    ON c.conversation_id = cs.conversation_id
+                WHERE c.user_id = %s
+                  AND cs.summary_text IS NOT NULL
+                  AND TRIM(cs.summary_text) <> ''
+                  AND cs.conversation_id <> %s
+                ORDER BY cs.updated_at DESC
+                LIMIT %s
+                """,
+                (
+                    user_id,
+                    current_conversation_id,
+                    limit,
+                ),
+            ).fetchall()
+
+        else:
+            rows = conn.execute(
+                """
+                SELECT
+                    cs.conversation_id,
+                    cs.summary_text,
+                    cs.updated_at
+                FROM conversation_summaries cs
+                JOIN conversations c
+                    ON c.conversation_id = cs.conversation_id
+                WHERE c.user_id = %s
+                  AND cs.summary_text IS NOT NULL
+                  AND TRIM(cs.summary_text) <> ''
+                ORDER BY cs.updated_at DESC
+                LIMIT %s
+                """,
+                (
+                    user_id,
+                    limit,
+                ),
+            ).fetchall()
+
+    return rows
 
 
 async def get_other_conversation_summaries(
