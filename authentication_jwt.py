@@ -4,7 +4,7 @@ import hmac
 import html
 import logging
 import os
-
+import asyncio
 import secrets
 import smtplib
 import threading
@@ -19,10 +19,10 @@ from pathlib import Path
 from typing import Optional
 
 import jwt
-
+from psycopg_pool import ConnectionPool
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -45,8 +45,12 @@ logger = logging.getLogger("gaash.auth")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    init_db()
-    yield
+    AUTH_DB_POOL.open()
+    try:
+        init_db()
+        yield
+    finally:
+        AUTH_DB_POOL.close()
 
 
 app = FastAPI(
@@ -69,6 +73,33 @@ if not JWT_SECRET:
     raise RuntimeError("GAASH_JWT_SECRET is not configured.")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+AUTH_SESSION_EXPIRE_DAYS = int(
+    os.getenv("AUTH_SESSION_EXPIRE_DAYS", "30")
+)
+
+AUTH_SESSION_COOKIE_NAME = os.getenv(
+    "AUTH_SESSION_COOKIE_NAME",
+    "gaash_session",
+)
+
+AUTH_COOKIE_SECURE = (
+    os.getenv("AUTH_COOKIE_SECURE", "true").lower()
+    == "true"
+)
+
+AUTH_COOKIE_SAMESITE = os.getenv(
+    "AUTH_COOKIE_SAMESITE",
+    "none",
+).lower()
+
+if AUTH_COOKIE_SAMESITE not in {
+    "lax",
+    "strict",
+    "none",
+}:
+    raise RuntimeError(
+        "AUTH_COOKIE_SAMESITE must be lax, strict, or none."
+    )
 
 OTP_EXPIRY_MINUTES = int(os.getenv("OTP_EXPIRY_MINUTES", "2"))
 OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "60"))
@@ -105,7 +136,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     # Authentication uses Authorization headers, not cross-site cookies.
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -136,7 +167,14 @@ def enforce_rate_limit(request: Request, scope: str, limit: int, window_seconds:
 
 class OTPServiceError(Exception):
     """Raised when an OTP cannot be delivered because the provider is not configured."""
-
+    
+AUTH_DB_POOL = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=1,
+    max_size=5,
+    timeout=5,
+    open=False,
+)
 
 # ============================================================
 # DATABASE
@@ -145,9 +183,13 @@ class OTPServiceError(Exception):
 def get_connection():
     return psycopg.connect(DATABASE_URL)
 
+@contextlib.contextmanager
+def db_connection():
+    with AUTH_DB_POOL.connection() as conn:
+        yield conn
 
 def init_db() -> None:
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -214,10 +256,50 @@ def init_db() -> None:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auth_sessions (
+                    id BIGSERIAL PRIMARY KEY,
+
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id)
+                        ON DELETE CASCADE,
+
+                    token_hash TEXT UNIQUE NOT NULL,
+
+                    expires_at TIMESTAMPTZ NOT NULL,
+
+                    revoked BOOLEAN NOT NULL
+                        DEFAULT FALSE,
+
+                    created_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+
+                    last_used_at TIMESTAMPTZ
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_auth_sessions_user
+                ON auth_sessions (
+                    user_id,
+                    expires_at
+                )
+                """
+            )
         create_privacy_tables(conn)
 
         conn.commit()
 
+def _health_db_sync() -> bool:
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            row = cur.fetchone()
+
+    return bool(row and row[0] == 1)
 
 # ============================================================
 # PASSWORD + OTP HELPERS
@@ -267,9 +349,16 @@ def hash_reset_token(token: str) -> str:
 def hash_access_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
+def hash_session_token(
+    token: str,
+) -> str:
+    return hashlib.sha256(
+        token.encode("utf-8")
+    ).hexdigest()
+
 
 def is_access_token_revoked(token: str) -> bool:
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM revoked_access_tokens WHERE token_hash = %s AND expires_at > CURRENT_TIMESTAMP",
@@ -282,7 +371,7 @@ def revoke_access_token(token: str) -> None:
     """Record a validated access token as revoked until its normal expiry."""
     payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     expires_at = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         with conn.cursor() as cur:
             # Opportunistically discard no-longer-relevant revocations.
             cur.execute("DELETE FROM revoked_access_tokens WHERE expires_at <= CURRENT_TIMESTAMP")
@@ -302,6 +391,265 @@ def as_utc_datetime(value: datetime | str) -> datetime:
     parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value)
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
+def create_auth_session(
+    conn,
+    user_id: int,
+) -> str:
+
+    raw_token = secrets.token_urlsafe(48)
+
+    token_hash = hash_session_token(
+        raw_token
+    )
+
+    expires_at = (
+        datetime.now(timezone.utc)
+        + timedelta(
+            days=AUTH_SESSION_EXPIRE_DAYS
+        )
+    )
+
+    with conn.cursor() as cur:
+
+        # Cheap opportunistic cleanup.
+        cur.execute(
+            """
+            DELETE FROM auth_sessions
+            WHERE expires_at <= CURRENT_TIMESTAMP
+               OR revoked = TRUE
+            """
+        )
+
+        cur.execute(
+            """
+            INSERT INTO auth_sessions (
+                user_id,
+                token_hash,
+                expires_at
+            )
+            VALUES (%s, %s, %s)
+            """,
+            (
+                user_id,
+                token_hash,
+                expires_at,
+            ),
+        )
+
+    return raw_token
+
+def set_auth_session_cookie(
+    response: Response,
+    token: str,
+) -> None:
+
+    response.set_cookie(
+        key=AUTH_SESSION_COOKIE_NAME,
+        value=token,
+        max_age=(
+            AUTH_SESSION_EXPIRE_DAYS
+            * 24
+            * 60
+            * 60
+        ),
+        httponly=True,
+        secure=AUTH_COOKIE_SECURE,
+        samesite=AUTH_COOKIE_SAMESITE,
+        path="/",
+    )
+
+
+def clear_auth_session_cookie(
+    response: Response,
+) -> None:
+
+    response.delete_cookie(
+        key=AUTH_SESSION_COOKIE_NAME,
+        path="/",
+        secure=AUTH_COOKIE_SECURE,
+        httponly=True,
+        samesite=AUTH_COOKIE_SAMESITE,
+    )
+    
+def enforce_trusted_origin(
+    request: Request,
+) -> None:
+
+    origin = request.headers.get(
+        "origin"
+    )
+
+    if not origin:
+        return
+
+    if origin not in CORS_ORIGINS:
+        raise HTTPException(
+            status_code=403,
+            detail="Untrusted request origin.",
+        )
+        
+def rotate_auth_session(
+    raw_token: str,
+) -> tuple[int, str, str, str]:
+
+    token_hash = hash_session_token(
+        raw_token
+    )
+
+    with contextlib.closing(
+        get_connection()
+    ) as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT
+                    s.id,
+                    s.user_id,
+                    s.expires_at,
+                    s.revoked,
+                    u.username,
+                    u.email,
+                    u.is_verified
+                FROM auth_sessions s
+
+                JOIN users u
+                    ON u.id = s.user_id
+
+                WHERE s.token_hash = %s
+
+                FOR UPDATE
+                """,
+                (token_hash,),
+            )
+
+            row = cur.fetchone()
+
+            if row is None:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Session expired or invalid.",
+                )
+
+            (
+                session_id,
+                user_id,
+                expires_at,
+                revoked,
+                username,
+                email,
+                is_verified,
+            ) = row
+
+            expiry = as_utc_datetime(
+                expires_at
+            )
+
+            if (
+                revoked
+                or not is_verified
+                or datetime.now(timezone.utc)
+                >= expiry
+            ):
+                cur.execute(
+                    """
+                    UPDATE auth_sessions
+                    SET revoked = TRUE
+                    WHERE id = %s
+                    """,
+                    (session_id,),
+                )
+
+                conn.commit()
+
+                raise HTTPException(
+                    status_code=401,
+                    detail="Session expired or invalid.",
+                )
+
+            # Old refresh token becomes unusable.
+            cur.execute(
+                """
+                UPDATE auth_sessions
+                SET
+                    revoked = TRUE,
+                    last_used_at =
+                        CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (session_id,),
+            )
+
+            new_token = secrets.token_urlsafe(
+                48
+            )
+
+            new_hash = hash_session_token(
+                new_token
+            )
+
+            new_expiry = (
+                datetime.now(timezone.utc)
+                + timedelta(
+                    days=AUTH_SESSION_EXPIRE_DAYS
+                )
+            )
+
+            cur.execute(
+                """
+                INSERT INTO auth_sessions (
+                    user_id,
+                    token_hash,
+                    expires_at,
+                    last_used_at
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    CURRENT_TIMESTAMP
+                )
+                """,
+                (
+                    user_id,
+                    new_hash,
+                    new_expiry,
+                ),
+            )
+
+        conn.commit()
+
+    return (
+        int(user_id),
+        username,
+        email,
+        new_token,
+    )
+    
+def revoke_auth_session(
+    raw_token: str,
+) -> None:
+
+    token_hash = hash_session_token(
+        raw_token
+    )
+
+    with contextlib.closing(
+        get_connection()
+    ) as conn:
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE auth_sessions
+                SET revoked = TRUE
+                WHERE token_hash = %s
+                """,
+                (token_hash,),
+            )
+
+        conn.commit()
 
 def normalize_email(value: str) -> str:
     return value.strip().lower()
@@ -673,7 +1021,7 @@ def get_reset_token_context(
         )
 
     token_hash = hash_reset_token(credentials.credentials)
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT id, user_id, used, expires_at FROM reset_tokens WHERE token_hash = %s FOR UPDATE",
@@ -817,8 +1165,32 @@ def home():
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "service": "Gaash Authentication API"}
+async def health():
+    try:
+        db_ok = await asyncio.wait_for(
+            asyncio.to_thread(_health_db_sync),
+            timeout=5.0,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Auth health check database failure: %s",
+            type(exc).__name__,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "degraded",
+                "service": "gaash-auth",
+                "database": "unavailable",
+            },
+        ) from exc
+
+    return {
+        "status": "ok",
+        "service": "gaash-auth",
+        "database": "ok" if db_ok else "unavailable",
+    }
 
 @app.get("/privacy/policy", response_model=PrivacyPolicyMetadataResponse)
 def get_privacy_policy_metadata():
@@ -831,7 +1203,7 @@ def get_privacy_policy_metadata():
 
 @app.get("/privacy/status", response_model=PrivacyStatusResponse)
 def get_privacy_status(user_id: int = Depends(get_current_user_id)):
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         acknowledgement = get_privacy_acknowledgement(conn, user_id)
         voice_consent = get_voice_transcription_consent(conn, user_id)
     return {
@@ -846,7 +1218,7 @@ def get_privacy_status(user_id: int = Depends(get_current_user_id)):
 @app.post("/privacy/accept", response_model=PrivacyStatusResponse)
 def accept_privacy_notice(data: PrivacyAcceptRequest, user_id: int = Depends(get_current_user_id)):
     try:
-        with contextlib.closing(get_connection()) as conn:
+        with db_connection() as conn:
             acknowledgement = record_privacy_acknowledgement(
                 conn,
                 user_id=user_id,
@@ -869,7 +1241,7 @@ def accept_privacy_notice(data: PrivacyAcceptRequest, user_id: int = Depends(get
 @app.post("/privacy/voice-transcription-consent", response_model=VoiceTranscriptionConsentResponse)
 def set_voice_transcription_consent(data: VoiceTranscriptionConsentRequest, user_id: int = Depends(get_current_user_id)):
     """Record a separately withdrawable choice for third-party audio transcription."""
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         if get_privacy_acknowledgement(conn, user_id) is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -899,7 +1271,7 @@ def register(data: RegisterRequest, request: Request):
             detail="Please provide a valid email address.",
         )
 
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         cursor = conn.cursor()
 
         cursor.execute(
@@ -983,7 +1355,7 @@ def verify_registration(data: VerifyRegistrationRequest, request: Request):
     if not is_email_address(email):
         raise HTTPException(status_code=400, detail="Please provide a valid email address.")
 
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         user = _lookup_user_by_email(conn, data.email)
 
         if user is None:
@@ -1036,7 +1408,7 @@ def resend_otp(data: RequestOTPRequest, request: Request):
         "message": "If your account is eligible, a new verification code has been sent."
     }
 
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         user = _lookup_user_by_email(conn, data.email)
 
         if user is None or user[4]:
@@ -1103,45 +1475,181 @@ def resend_otp(data: RequestOTPRequest, request: Request):
     return generic_response
 
 
-@app.post("/auth/login", response_model=AuthTokenResponse)
-def login(data: LoginRequest, request: Request):
-    enforce_rate_limit(request, "login", limit=10, window_seconds=600)
-    email = normalize_email(data.email)
+@app.post(
+    "/auth/login",
+    response_model=AuthTokenResponse,
+)
+def login(
+    data: LoginRequest,
+    request: Request,
+    response: Response,
+):
+    enforce_rate_limit(
+        request,
+        "login",
+        limit=10,
+        window_seconds=600,
+    )
+
+    email = normalize_email(
+        data.email
+    )
+
     if not is_email_address(email):
-        raise HTTPException(status_code=400, detail="Please provide a valid email address.")
-
-    with contextlib.closing(get_connection()) as conn:
-        user = _lookup_user_by_email(conn, email)
-
-    if user is None or not verify_password(data.password, user[3]):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or account not verified.",
+            status_code=400,
+            detail=(
+                "Please provide a valid "
+                "email address."
+            ),
         )
 
-    user_id, username, stored_identifier, _, is_verified = user[0], user[1], user[2], user[3], user[4]
-    if not is_verified:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials or account not verified.",
+    with contextlib.closing(
+        get_connection()
+    ) as conn:
+
+        user = _lookup_user_by_email(
+            conn,
+            email,
         )
+
+        if (
+            user is None
+            or not verify_password(
+                data.password,
+                user[3],
+            )
+        ):
+            raise HTTPException(
+                status_code=
+                    status.HTTP_401_UNAUTHORIZED,
+                detail=(
+                    "Invalid credentials or "
+                    "account not verified."
+                ),
+            )
+
+        (
+            user_id,
+            username,
+            stored_email,
+            _,
+            is_verified,
+        ) = user
+
+        if not is_verified:
+            raise HTTPException(
+                status_code=
+                    status.HTTP_401_UNAUTHORIZED,
+                detail=(
+                    "Invalid credentials or "
+                    "account not verified."
+                ),
+            )
+
+        refresh_token = create_auth_session(
+            conn,
+            user_id,
+        )
+
+        conn.commit()
 
     gaash_id = f"GSH-{user_id}"
-    token = create_access_token(user_id, gaash_id)
+
+    access_token = create_access_token(
+        user_id,
+        gaash_id,
+    )
+
+    set_auth_session_cookie(
+        response,
+        refresh_token,
+    )
 
     return {
         "message": "Login successful.",
-        "access_token": token,
+        "access_token": access_token,
         "token_type": "bearer",
         "user": {
             "user_id": user_id,
             "gaash_id": gaash_id,
             "username": username,
-            "email": stored_identifier,
+            "email": stored_email,
         },
         "next_step": "dashboard",
     }
 
+@app.post(
+    "/auth/refresh",
+    response_model=AuthTokenResponse,
+)
+def refresh_session(
+    request: Request,
+    response: Response,
+):
+    enforce_rate_limit(
+        request,
+        "refresh-session",
+        limit=30,
+        window_seconds=600,
+    )
+
+    enforce_trusted_origin(
+        request
+    )
+
+    refresh_token = (
+        request.cookies.get(
+            AUTH_SESSION_COOKIE_NAME
+        )
+    )
+
+    if not refresh_token:
+        raise HTTPException(
+            status_code=401,
+            detail="No active session.",
+        )
+
+    try:
+        (
+            user_id,
+            username,
+            email,
+            new_refresh_token,
+        ) = rotate_auth_session(
+            refresh_token
+        )
+
+    except HTTPException:
+        clear_auth_session_cookie(
+            response
+        )
+        raise
+
+    gaash_id = f"GSH-{user_id}"
+
+    access_token = create_access_token(
+        user_id,
+        gaash_id,
+    )
+
+    set_auth_session_cookie(
+        response,
+        new_refresh_token,
+    )
+
+    return {
+        "message": "Session refreshed.",
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "user_id": user_id,
+            "gaash_id": gaash_id,
+            "username": username,
+            "email": email,
+        },
+        "next_step": "dashboard",
+    }
 
 @app.post("/auth/forgot-password", response_model=AuthMessageResponse)
 def forgot_password(data: RequestOTPRequest, request: Request):
@@ -1150,7 +1658,7 @@ def forgot_password(data: RequestOTPRequest, request: Request):
         "message": "If an account exists for this email, a verification code has been sent to that email."
     }
 
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         user = _lookup_user_by_email(conn, data.email)
 
         if user is None or not user[4]:
@@ -1205,7 +1713,7 @@ def verify_reset_otp(data: VerifyResetOTPRequest, request: Request):
     if not is_email_address(email):
         raise HTTPException(status_code=400, detail="Please provide a valid email address.")
 
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         user = _lookup_user_by_email(conn, data.email)
         if user is None or not user[4]:
             raise HTTPException(
@@ -1245,7 +1753,7 @@ def reset_password(
     reset_context: ResetTokenContext = Depends(get_reset_token_context),
 ):
     enforce_rate_limit(request, "reset-password", limit=5, window_seconds=600)
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -1265,6 +1773,17 @@ def reset_password(
             cur.execute(
                 "UPDATE users SET password = %s WHERE id = %s",
                 (hash_password(data.new_password), reset_context.user_id),
+            )
+            cur.execute(
+                """
+                UPDATE auth_sessions
+                SET revoked = TRUE
+                WHERE user_id = %s
+                  AND revoked = FALSE
+                """,
+                (
+                    reset_context.user_id,
+                ),
             )
             cur.execute(
                 """
@@ -1290,22 +1809,60 @@ def reset_password(
     }
 
 
-@app.post("/auth/logout", response_model=AuthMessageResponse)
+@app.post(
+    "/auth/logout",
+    response_model=AuthMessageResponse,
+)
 def logout(
     request: Request,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    _: int = Depends(get_current_user_id),
+    response: Response,
+    credentials:
+        HTTPAuthorizationCredentials
+        = Depends(security),
+    _: int = Depends(
+        get_current_user_id
+    ),
 ):
-    enforce_rate_limit(request, "logout", limit=20, window_seconds=600)
-    # The dependency has already validated the bearer scheme, purpose, expiry,
-    # signature, and user association before this revocation is persisted.
-    revoke_access_token(credentials.credentials)
-    return {"message": "Signed out."}
+    enforce_rate_limit(
+        request,
+        "logout",
+        limit=20,
+        window_seconds=600,
+    )
+
+    enforce_trusted_origin(
+        request
+    )
+
+    # Kill current access token.
+    revoke_access_token(
+        credentials.credentials
+    )
+
+    # Kill persistent browser session.
+    refresh_token = (
+        request.cookies.get(
+            AUTH_SESSION_COOKIE_NAME
+        )
+    )
+
+    if refresh_token:
+        revoke_auth_session(
+            refresh_token
+        )
+
+    clear_auth_session_cookie(
+        response
+    )
+
+    return {
+        "message": "Signed out."
+    }
 
 
 @app.get("/me", response_model=CurrentUserResponse)
 def get_current_user(user_id: int = Depends(get_current_user_id)):
-    with contextlib.closing(get_connection()) as conn:
+    with db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
