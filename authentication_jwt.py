@@ -132,6 +132,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
