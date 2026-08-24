@@ -3059,7 +3059,7 @@ def _get_other_conversation_summaries_sync(
                 cs.updated_at
             FROM conversation_summaries cs
             JOIN conversations c
-                ON c.id = cs.conversation_id
+                ON c.conversation_id = cs.conversation_id
             WHERE c.user_id = %s
               AND cs.summary_text IS NOT NULL
               AND TRIM(cs.summary_text) <> ''
