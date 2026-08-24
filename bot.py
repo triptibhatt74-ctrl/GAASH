@@ -3179,7 +3179,7 @@ def _export_user_data_sync(
             SELECT *
             FROM conversations
             WHERE user_id = %s
-            ORDER BY created_at ASC
+            ORDER BY timestamp ASC
             """,
             (user_id,),
         ).fetchall()
@@ -3189,7 +3189,7 @@ def _export_user_data_sync(
             SELECT *
             FROM conversation_messages
             WHERE user_id = %s
-            ORDER BY created_at ASC
+            ORDER BY timestamp ASC
             """,
             (user_id,),
         ).fetchall()
@@ -3199,7 +3199,7 @@ def _export_user_data_sync(
             SELECT *
             FROM user_memories
             WHERE user_id = %s
-            ORDER BY created_at ASC
+            ORDER BY timestamp ASC
             """,
             (user_id,),
         ).fetchall()
@@ -3209,7 +3209,7 @@ def _export_user_data_sync(
             SELECT *
             FROM screening_measurements
             WHERE user_id = %s
-            ORDER BY created_at ASC
+            ORDER BY timestamp ASC
             """,
             (user_id,),
         ).fetchall()
@@ -3219,7 +3219,7 @@ def _export_user_data_sync(
             SELECT *
             FROM wellbeing_reports
             WHERE user_id = %s
-            ORDER BY created_at ASC
+            ORDER BY timestamp ASC
             """,
             (user_id,),
         ).fetchall()
