@@ -100,6 +100,12 @@ if AUTH_COOKIE_SAMESITE not in {
     raise RuntimeError(
         "AUTH_COOKIE_SAMESITE must be lax, strict, or none."
     )
+    
+if AUTH_COOKIE_SAMESITE == "none" and not AUTH_COOKIE_SECURE:
+    raise RuntimeError(
+        "AUTH_COOKIE_SECURE must be true when "
+        "AUTH_COOKIE_SAMESITE is none."
+    )
 
 OTP_EXPIRY_MINUTES = int(os.getenv("OTP_EXPIRY_MINUTES", "2"))
 OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "60"))
@@ -136,7 +142,6 @@ CORS_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    # Authentication uses Authorization headers, not cross-site cookies.
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -497,9 +502,7 @@ def rotate_auth_session(
         raw_token
     )
 
-    with contextlib.closing(
-        get_connection()
-    ) as conn:
+    with db_connection() as conn:
 
         with conn.cursor() as cur:
 
@@ -636,9 +639,7 @@ def revoke_auth_session(
         raw_token
     )
 
-    with contextlib.closing(
-        get_connection()
-    ) as conn:
+    with db_connection() as conn:
 
         with conn.cursor() as cur:
             cur.execute(

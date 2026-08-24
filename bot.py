@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from zoneinfo import ZoneInfo
 import asyncio
 import base64
 import binascii
@@ -28,14 +28,14 @@ from privacy import (
 import jwt
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from google import genai
 from google.genai import types
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
-
+from psycopg_pool import ConnectionPool
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -59,12 +59,85 @@ RESOURCES_FILE = os.environ.get("RESOURCES_FILE", str(Path(__file__).resolve().p
 JWT_SECRET = os.getenv("GAASH_JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 
-MAX_RECENT_MESSAGES = int(os.environ.get("MAX_RECENT_MESSAGES", "20"))
-MAX_WEEKLY_SUMMARIES = int(os.environ.get("MAX_WEEKLY_SUMMARIES", "4"))
-MAX_AUDIO_BYTES = int(os.environ.get("MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))
+MAX_RECENT_MESSAGES = int(os.environ.get("MAX_RECENT_MESSAGES", "30"))
+CONVERSATION_SUMMARY_MIN_NEW_MESSAGES = int(
+    os.environ.get("CONVERSATION_SUMMARY_MIN_NEW_MESSAGES", "8")
+)
 
+CONVERSATION_SUMMARY_MAX_SOURCE_CHARS = int(
+    os.environ.get("CONVERSATION_SUMMARY_MAX_SOURCE_CHARS", "18000")
+)
+CROSS_CONVERSATION_SUMMARY_LIMIT = int(
+    os.environ.get(
+        "CROSS_CONVERSATION_SUMMARY_LIMIT",
+        "3",
+    )
+)
+
+CROSS_CONVERSATION_SUMMARY_CANDIDATES = int(
+    os.environ.get(
+        "CROSS_CONVERSATION_SUMMARY_CANDIDATES",
+        "20",
+    )
+)
+
+CROSS_CONVERSATION_SUMMARY_MAX_CHARS = int(
+    os.environ.get(
+        "CROSS_CONVERSATION_SUMMARY_MAX_CHARS",
+        "3500",
+    )
+)
+MAX_WEEKLY_SUMMARIES = int(os.environ.get("MAX_WEEKLY_SUMMARIES", "4"))
+PRIVATE_CONTEXT_MAX_CHARS = int(
+    os.environ.get(
+        "PRIVATE_CONTEXT_MAX_CHARS",
+        "16000",
+    )
+)
+
+PROFILE_CONTEXT_MAX_CHARS = int(
+    os.environ.get(
+        "PROFILE_CONTEXT_MAX_CHARS",
+        "1200",
+    )
+)
+
+MEMORY_CONTEXT_MAX_CHARS = int(
+    os.environ.get(
+        "MEMORY_CONTEXT_MAX_CHARS",
+        "2500",
+    )
+)
+
+CURRENT_SUMMARY_MAX_CHARS = int(
+    os.environ.get(
+        "CURRENT_SUMMARY_MAX_CHARS",
+        "2500",
+    )
+)
+MAX_AUDIO_BYTES = int(os.environ.get("MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))
+REPORTING_TIMEZONE_NAME = os.getenv(
+    "REPORTING_TIMEZONE",
+    "Asia/Kolkata",
+)
+
+try:
+    REPORTING_TIMEZONE = ZoneInfo(
+        REPORTING_TIMEZONE_NAME
+    )
+except Exception as exc:
+    raise RuntimeError(
+        f"Invalid REPORTING_TIMEZONE: "
+        f"{REPORTING_TIMEZONE_NAME}"
+    ) from exc
 # Analytics date-range guard: prevents unbounded table scans.
 MAX_ANALYTICS_DAYS = int(os.environ.get("MAX_ANALYTICS_DAYS", "400"))
+
+DATA_RETENTION_DAYS = max(
+    30,
+    int(os.getenv("DATA_RETENTION_DAYS", "365")),
+)
+
 
 SUPPORTED_AUDIO_MEDIA_TYPES = {
     "audio/mpeg", "audio/mp3", "audio/mp4", "audio/m4a", "audio/x-m4a",
@@ -102,8 +175,34 @@ SUPPORTED_THEMES = {"light", "dark", "system"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_gaash_tables()
-    yield
+    BOT_DB_POOL.open()
+
+    try:
+        await asyncio.to_thread(
+            init_gaash_tables
+        )
+
+        try:
+            cleanup_result = await (
+                cleanup_expired_backend_data()
+            )
+
+            logger.info(
+                "Backend retention cleanup completed: %s",
+                cleanup_result,
+            )
+
+        except Exception as exc:
+            # Cleanup failure should NOT stop Gaash from starting.
+            logger.warning(
+                "Backend retention cleanup failed: %s",
+                type(exc).__name__,
+            )
+
+        yield
+
+    finally:
+        BOT_DB_POOL.close()
 
 app = FastAPI(
     title="GAASH Bot API",
@@ -177,8 +276,55 @@ Do not use a universal pattern of validation + advice + question. For ordinary t
 
 LANGUAGE AND CONTEXT
 Use English, Hindi, Hinglish, Kashmiri, Urdu, or Dogri as the user does; use preferred_language only as a fallback. Match formality, energy, and density without copying errors, forcing slang, overusing emojis, using pet names, or becoming overfamiliar. Be less playful when distress is serious. Possible regional stressors are not facts unless supplied.
+Private backend context may include an older-current-conversation summary. Treat
+it as compressed continuity from earlier turns of the current conversation.
+Use it naturally when relevant, but never quote or recap it merely to demonstrate
+memory. Recent messages and the user's current statement take precedence when
+they conflict with the summary.
 
-Use only the supplied backend context. It is private reference material, not wording to recap. Current statements override old context. Do not claim memory outside it, ask for information already clear in it, or imitate the phrasing/cadence of previous assistant replies.
+COMPANIONSHIP AND CONTINUITY
+
+Gaash should feel like one continuous conversational presence rather than
+switching between a playful chatbot and a scripted wellbeing assistant.
+
+In casual conversation, natural humour, teasing, short reactions, running jokes,
+and playful continuity are welcome when they fit the user's tone.
+
+When the user is struggling, retain the same underlying conversational voice but
+reduce playfulness according to seriousness. Do not suddenly become formal,
+clinical, verbose, or counsellor-like.
+
+Companionship means paying attention and responding meaningfully, not repeatedly
+explaining why the user's feelings are understandable.
+
+Distinguish between someone wanting to vent, wanting company, wanting consolation,
+wanting reassurance, and explicitly asking for practical help.
+
+If the user asks to be consoled, console them rather than repeatedly interviewing
+them.
+
+Do not encourage emotional dependency, exclusivity, withdrawal from real people,
+or imply that Gaash is a human friend, therapist, or the user's only source of
+support.
+
+Use only supplied backend context. It may contain recent conversation, profile
+information, relevant long-term conversational memories, screening context, and
+summaries. Treat all of it as private reference material, not wording to recap.
+
+Use remembered details naturally only when they genuinely improve the current
+reply. Never list memories or mention them merely to prove that you remember the
+user. Current user statements override older memory.
+
+Harmless shared references, preferences, ongoing projects, and recurring jokes
+may be reused naturally when relevant.
+
+Do not claim to remember anything that is absent from supplied context. If the
+user asks whether you remember something that was not retrieved, say so naturally
+instead of guessing.
+
+Never unexpectedly surface sensitive historical information simply because it
+exists in private context. Do not imitate the wording or cadence of previous
+assistant replies.
 
 PASSIVE SCREENING AND STRUCTURED EVIDENCE
 Screen quietly while conversing. Extract only what the user actually states; never infer from grammar, emojis, demographics, language, intensity, or visual-emotion metadata. Do not let extraction make the visible reply clinical or turn normal conversation into a scale. Null is correct when evidence is missing.
@@ -202,6 +348,101 @@ Before returning, rewrite response_to_user if it mostly repeats the user, uses i
 If the backend identifies an active screening item, it may provide it in private context. Ask only that item naturally when appropriate; accept only a real frequency as scored evidence and leave unsupported values null.
 """
 
+MEMORY_EXTRACTION_PROMPT = """
+You are the private conversational-memory extractor for GAASH.
+
+Extract only durable, useful conversational information explicitly stated by
+the user that could improve continuity in future conversations.
+
+GOOD MEMORY:
+- user's name or identity information
+- stable preferences
+- hobbies or interests
+- education information
+- ongoing projects
+- goals
+- routines
+- important non-sensitive relationship/context information
+- ongoing non-sensitive situations
+- recurring harmless jokes or conversational references
+- information the user explicitly asks Gaash to remember
+
+DO NOT STORE:
+- passwords
+- authentication details
+- OTPs
+- tokens
+- addresses or highly sensitive identifiers
+- temporary statements that are unlikely to matter later
+- guesses or inferred facts
+- model emotion classifications
+- PHQ-9/GAD-7/PSS-10 scores
+- diagnoses
+- medical details as conversational memory
+- crisis or self-harm disclosures as conversational memory
+- private wellbeing information merely because it was mentioned
+
+Do not infer information the user did not clearly state.
+
+Choose memory_type from:
+- identity
+- preference
+- project
+- education
+- relationship_context
+- ongoing_situation
+- conversation_reference
+- goal
+- routine
+- general
+
+Use concise snake_case memory_key values.
+
+Examples:
+current_project
+favorite_hobby
+relationship_to_gaash
+education
+career_goal
+preferred_conversation_style
+gaash_running_joke
+
+If nothing deserves long-term memory, return:
+{"memories":[]}
+
+Return structured output only.
+""".strip()
+
+CONVERSATION_SUMMARY_PROMPT = """
+You maintain a compact private continuity summary for one GAASH conversation.
+
+Update the existing summary using only the supplied conversation messages.
+
+Preserve information that could matter later in this same conversation:
+- the main topics and how they developed
+- important facts explicitly supplied by the user
+- decisions, plans, preferences, goals, projects, and ongoing situations
+- unresolved questions or threads
+- useful shared conversational references or running jokes
+- corrections the user made to earlier information
+- interaction preferences the user explicitly expressed
+
+Be selective. Do not produce a transcript.
+
+Do not:
+- invent facts
+- diagnose
+- interpret screening scores
+- add advice
+- copy long quotations
+- describe backend analytics
+- treat assistant guesses as user facts
+
+When newer information contradicts older information, prefer the newer information.
+
+Write a compact continuity summary, preferably under 220 words.
+Plain text only.
+""".strip()
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -210,16 +451,23 @@ If the backend identifies an active screening item, it may provide it in private
 T = TypeVar("T")
 DatabaseRow: TypeAlias = Dict[str, Any]
 
+BOT_DB_POOL = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=1,
+    max_size=max(
+        2,
+        int(os.environ.get("BOT_DB_POOL_MAX_SIZE", "5")),
+    ),
+    kwargs={
+        "row_factory": dict_row,
+    },
+    open=False,
+    timeout=10,
+)
 @contextmanager
 def get_conn():
-    conn = psycopg.connect(
-        DATABASE_URL,
-        row_factory=dict_row,
-    )
-    try:
+    with BOT_DB_POOL.connection() as conn:
         yield conn
-    finally:
-        conn.close()
 
 
 async def run_db(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
@@ -229,6 +477,18 @@ async def run_db(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
 def _iso_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def safe_log_identifier(
+    value: Optional[str],
+) -> str:
+    if not value:
+        return "none"
+
+    value = str(value)
+
+    if len(value) <= 8:
+        return "***"
+
+    return f"{value[:4]}...{value[-4:]}"
 
 def _parse_conversation_cursor(value: Optional[str]) -> Optional[tuple[datetime, int]]:
     if value is None:
@@ -298,6 +558,40 @@ def init_gaash_tables() -> None:
                         CHECK (role IN ('user', 'assistant')),
                     content TEXT NOT NULL,
                     timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            
+                        # ---------------------------------------------------------
+            # ROLLING CONVERSATION SUMMARIES
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_summaries (
+                    conversation_id TEXT PRIMARY KEY,
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id)
+                        ON DELETE CASCADE,
+
+                    summary_text TEXT NOT NULL,
+
+                    summarized_through_message_id BIGINT NOT NULL DEFAULT 0,
+
+                    created_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+
+                    updated_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conversation_summary_user
+                ON conversation_summaries (
+                    user_id,
+                    updated_at DESC
                 )
                 """
             )
@@ -553,6 +847,66 @@ def init_gaash_tables() -> None:
                     notification_prefs TEXT,
                     updated_at TIMESTAMPTZ NOT NULL
                         DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            
+                        # ---------------------------------------------------------
+            # LONG-TERM CONVERSATIONAL MEMORY
+            # ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_memories (
+                    id BIGSERIAL PRIMARY KEY,
+
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id)
+                        ON DELETE CASCADE,
+
+                    memory_key TEXT NOT NULL,
+                    memory_value TEXT NOT NULL,
+
+                    memory_type TEXT NOT NULL DEFAULT 'general'
+                        CHECK (
+                            memory_type IN (
+                                'identity',
+                                'preference',
+                                'project',
+                                'education',
+                                'relationship_context',
+                                'ongoing_situation',
+                                'conversation_reference',
+                                'goal',
+                                'routine',
+                                'general'
+                            )
+                        ),
+
+                    source_conversation_id TEXT,
+
+                    confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0
+                        CHECK (
+                            confidence >= 0.0
+                            AND confidence <= 1.0
+                        ),
+
+                    created_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+
+                    updated_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+
+                    UNIQUE (user_id, memory_key)
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_user_memories_user_updated
+                ON user_memories (
+                    user_id,
+                    updated_at DESC
                 )
                 """
             )
@@ -938,6 +1292,44 @@ class NLPAnalysis(BaseModel):
     response_to_user: str
     emergency_flag: bool
     follow_up_question: Optional[FollowUpQuestion] = None
+    
+class MemoryCandidate(BaseModel):
+    memory_key: str = Field(
+        ...,
+        min_length=2,
+        max_length=80,
+    )
+
+    memory_value: str = Field(
+        ...,
+        min_length=2,
+        max_length=500,
+    )
+
+    memory_type: Literal[
+        "identity",
+        "preference",
+        "project",
+        "education",
+        "relationship_context",
+        "ongoing_situation",
+        "conversation_reference",
+        "goal",
+        "routine",
+        "general",
+    ]
+
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+    )
+
+
+class MemoryExtraction(BaseModel):
+    memories: List[MemoryCandidate] = Field(
+        default_factory=list
+    )
 
 
 _ITEM_ID_RANGES = {"PHQ-9": (1, 9), "GAD-7": (1, 7), "PSS-10": (1, 10)}
@@ -1129,7 +1521,7 @@ class AssessmentAnswerResponse(BaseModel):
     scale: Literal["PHQ-9", "GAD-7", "PSS-10"]
     session_found: bool
     accepted: bool
-    status: Literal["active", "paused", "completed", "cancelled"]
+    status: Literal["active", "paused", "completed", "cancelled", "invalid score"]
     completed: bool
     current_item: Optional[int] = None
     total: Optional[int] = None
@@ -1189,6 +1581,8 @@ class AnalyticsResponse(BaseModel):
     conversation_activity: List[Dict[str, Any]]
     emotion_distribution: List[Dict[str, Any]]
     check_ins: List[Dict[str, Any]]
+    period_start: str
+    period_end: str
 
 
 class ReportResponse(BaseModel):
@@ -1214,6 +1608,9 @@ class WeeklySummaryRouteResponse(BaseModel):
 
 class RecommendationsResponse(BaseModel):
     recommendations: List[Dict[str, Any]]
+    limit: int
+    has_more: bool
+    next_before_id: Optional[int] = None
 
 
 class FollowUpRequest(BaseModel):
@@ -1278,6 +1675,11 @@ class SubmitAnswerRequest(BaseModel):
 class ReportRequest(BaseModel):
     start: Optional[str] = None
     end: Optional[str] = None
+    
+def _health_db_sync() -> bool:
+    with get_conn() as conn:
+        row = conn.execute("SELECT 1 AS ok").fetchone()
+        return bool(row and row["ok"] == 1)
 
 def _get_profile_sync(user_id: int) -> Optional[DatabaseRow]:
     with get_conn() as conn:
@@ -1298,6 +1700,33 @@ def _get_profile_sync(user_id: int) -> Optional[DatabaseRow]:
             (user_id,),
         ).fetchone()
 
+def _get_llm_profile_sync(
+    user_id: int,
+) -> Optional[dict]:
+
+    row = _get_profile_sync(user_id)
+
+    if row is None:
+        return None
+
+    return {
+        "username": row.get("username"),
+        "display_name": row.get("display_name"),
+        "preferred_language": row.get(
+            "preferred_language"
+        ),
+    }
+
+
+async def get_llm_profile(
+    user_id: int,
+) -> Optional[dict]:
+
+    return await run_db(
+        _get_llm_profile_sync,
+        user_id,
+    )
+    
 class ProfileUpdateRequest(BaseModel):
     display_name: Optional[str] = Field(default=None, max_length=80)
     preferred_language: Optional[str] = Field(default=None, max_length=20)
@@ -1611,14 +2040,29 @@ def _record_session_item_sync(
                 "reason": "Screening session not found.",
             }
         if session["status"] != "active":
+            current_status = session["status"]
+
+            reason_map = {
+                "paused": "Screening session is paused.",
+                "cancelled": "Screening session is cancelled.",
+                "completed": "Screening session is already completed.",
+            }
+
             return {
                 "session_found": True,
                 "accepted": False,
-                "completed": session["status"] == "completed",
-                "status": session["status"],
-                "current_item": session["current_item"],
+                "status": current_status,
+                "completed": current_status == "completed",
+                "current_item": (
+                    None
+                    if current_status == "completed"
+                    else session["current_item"]
+                ),
                 "total": None,
-                "reason": "Screening session is not active.",
+                "reason": reason_map.get(
+                    current_status,
+                    "Screening session is not active.",
+                ),
             }
         if not 1 <= item_id <= _SCALE_ITEM_COUNT[session["scale"]]:
             return {
@@ -1771,7 +2215,10 @@ def _latest_finalized_totals_sync(user_id: int) -> Dict[str, Optional[int]]:
             (user_id, user_id),
         ).fetchall()
     for row in rows:
-        totals[row["assessment_type"]] = row["total"]
+        scale = row["assessment_type"]
+
+        if scale in totals:
+            totals[scale] = int(row["total"])
     return totals
 
 
@@ -1952,13 +2399,44 @@ def calculate_composite_risk(
     return "LOW_RISK"
 
 
+RISK_CATEGORIES = {
+    "UNKNOWN",
+    "LOW_RISK",
+    "MODERATE_RISK",
+    "HIGH_RISK",
+}
+
+
 def get_risk_details(
-    phq9, gad7, pss10, sleep_hours, emotion, trajectory, emergency,
+    phq9,
+    gad7,
+    pss10,
+    sleep_hours,
+    emotion,
+    trajectory,
+    emergency,
 ) -> dict:
+
     category = calculate_composite_risk(
-        phq9=phq9, gad7=gad7, pss10=pss10,
-        sleep_hours=sleep_hours, trajectory=trajectory, emergency=emergency,
+        phq9=phq9,
+        gad7=gad7,
+        pss10=pss10,
+        sleep_hours=sleep_hours,
+        trajectory=trajectory,
+        emergency=emergency,
     )
+
+    category = str(
+        category or "UNKNOWN"
+    ).strip().upper()
+
+    if category not in RISK_CATEGORIES:
+        logger.warning(
+            "Unexpected risk category returned: %r",
+            category,
+        )
+        category = "UNKNOWN"
+
     return {
         "risk_category": category,
         "emergency": emergency,
@@ -1970,7 +2448,44 @@ def get_risk_details(
         "emotion_context": emotion,
     }
 
+def _cleanup_expired_backend_data_sync() -> dict:
+    with get_conn() as conn:
+        deleted = {}
 
+        # Old dismissed suggestion state is disposable.
+        cur = conn.execute(
+            """
+            DELETE FROM suggested_states
+            WHERE dismissed = TRUE
+              AND created_at <
+                  CURRENT_TIMESTAMP
+                  - (%s * INTERVAL '1 day')
+            """,
+            (DATA_RETENTION_DAYS,),
+        )
+        deleted["suggested_states"] = cur.rowcount
+
+        # Completed/cancelled follow-up records can age out.
+        cur = conn.execute(
+            """
+            DELETE FROM follow_ups
+            WHERE status IN ('completed', 'cancelled')
+              AND created_at <
+                  CURRENT_TIMESTAMP
+                  - (%s * INTERVAL '1 day')
+            """,
+            (DATA_RETENTION_DAYS,),
+        )
+        deleted["follow_ups"] = cur.rowcount
+
+        conn.commit()
+
+        return deleted
+    
+async def cleanup_expired_backend_data() -> dict:
+    return await run_db(
+        _cleanup_expired_backend_data_sync
+    )
 # ---------------------------------------------------------------------------
 # Conversation memory
 # ---------------------------------------------------------------------------
@@ -2000,6 +2515,1048 @@ async def save_message(
         conversation_id,
     )
 
+def _get_user_memories_sync(
+    user_id: int,
+    limit: int = 30,
+) -> List[dict]:
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                memory_key,
+                memory_value,
+                memory_type,
+                confidence,
+                source_conversation_id,
+                updated_at
+            FROM user_memories
+            WHERE user_id = %s
+            ORDER BY updated_at DESC
+            LIMIT %s
+            """,
+            (
+                user_id,
+                limit,
+            ),
+        ).fetchall()
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+
+async def get_user_memories(
+    user_id: int,
+    limit: int = 30,
+) -> List[dict]:
+
+    return await run_db(
+        _get_user_memories_sync,
+        user_id,
+        limit,
+    )
+    
+def _upsert_user_memory_sync(
+    user_id: int,
+    memory_key: str,
+    memory_value: str,
+    memory_type: str,
+    conversation_id: Optional[str],
+    confidence: float,
+) -> None:
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_memories (
+                user_id,
+                memory_key,
+                memory_value,
+                memory_type,
+                source_conversation_id,
+                confidence
+            )
+            VALUES (
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s
+            )
+
+            ON CONFLICT (
+                user_id,
+                memory_key
+            )
+
+            DO UPDATE SET
+                memory_value =
+                    EXCLUDED.memory_value,
+
+                memory_type =
+                    EXCLUDED.memory_type,
+
+                source_conversation_id =
+                    EXCLUDED.source_conversation_id,
+
+                confidence =
+                    EXCLUDED.confidence,
+
+                updated_at =
+                    CURRENT_TIMESTAMP
+            """,
+            (
+                user_id,
+                memory_key,
+                memory_value,
+                memory_type,
+                conversation_id,
+                confidence,
+            ),
+        )
+
+        conn.commit()
+
+
+async def upsert_user_memory(
+    user_id: int,
+    memory: MemoryCandidate,
+    conversation_id: Optional[str],
+) -> None:
+
+    await run_db(
+        _upsert_user_memory_sync,
+        user_id,
+        memory.memory_key,
+        memory.memory_value,
+        memory.memory_type,
+        conversation_id,
+        memory.confidence,
+    )
+    
+def _memory_words(
+    text: str,
+) -> set[str]:
+
+    return {
+        word
+        for word in re.findall(
+            r"[A-Za-z0-9_]+",
+            text.lower(),
+        )
+        if len(word) >= 3
+    }
+    
+def select_relevant_memories(
+    memories: List[dict],
+    current_message: str,
+    limit: int = 6,
+) -> List[dict]:
+
+    if not memories:
+        return []
+
+    query_words = _memory_words(
+        current_message
+    )
+
+    scored: List[tuple[float, dict]] = []
+
+    for memory in memories:
+
+        searchable = " ".join(
+            [
+                str(
+                    memory.get(
+                        "memory_key",
+                        "",
+                    )
+                ),
+                str(
+                    memory.get(
+                        "memory_value",
+                        "",
+                    )
+                ),
+                str(
+                    memory.get(
+                        "memory_type",
+                        "",
+                    )
+                ),
+            ]
+        )
+
+        memory_words = _memory_words(
+            searchable
+        )
+
+        overlap = len(
+            query_words
+            & memory_words
+        )
+
+        memory_type = memory.get(
+            "memory_type"
+        )
+
+        type_bonus = {
+            "identity": 3.0,
+            "relationship_context": 2.5,
+            "ongoing_situation": 2.0,
+            "project": 1.8,
+            "goal": 1.8,
+            "education": 1.5,
+            "preference": 1.5,
+            "routine": 1.2,
+            "conversation_reference": 1.0,
+            "general": 0.0,
+        }.get(memory_type, 0.0)
+
+        confidence = float(
+            memory.get(
+                "confidence",
+                1.0,
+            )
+            or 1.0
+        )
+
+        score = (
+            overlap * 2.0
+            + type_bonus
+        ) * confidence
+
+        if score > 0:
+            scored.append(
+                (
+                    score,
+                    memory,
+                )
+            )
+
+    scored.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    return [
+        memory
+        for _, memory
+        in scored[:limit]
+    ]
+def _memory_search_terms(
+    text: str,
+) -> set[str]:
+    return {
+        token
+        for token in re.findall(
+            r"[a-zA-Z0-9_'-]{3,}",
+            text.lower(),
+        )
+    }
+    
+def select_relevant_conversation_summaries(
+    summaries: List[DatabaseRow],
+    current_message: str,
+    limit: int = CROSS_CONVERSATION_SUMMARY_LIMIT,
+) -> List[DatabaseRow]:
+
+    if not summaries or limit <= 0:
+        return []
+
+    query_terms = _memory_search_terms(
+        current_message
+    )
+
+    ranked: list[
+        tuple[float, int, DatabaseRow]
+    ] = []
+
+    for index, summary in enumerate(summaries):
+        text = str(
+            summary.get("summary_text") or ""
+        ).strip()
+
+        if not text:
+            continue
+
+        summary_terms = _memory_search_terms(
+            text
+        )
+
+        overlap = len(
+            query_terms & summary_terms
+        )
+
+        # Strongly reward actual lexical relevance.
+        relevance_score = float(overlap) * 3.0
+
+        # A small recency preference means a recent summary can still
+        # provide continuity when the user's message is very short.
+        recency_bonus = max(
+            0.0,
+            1.0 - (index * 0.05),
+        )
+
+        score = (
+            relevance_score
+            + recency_bonus
+        )
+
+        ranked.append(
+            (
+                score,
+                index,
+                summary,
+            )
+        )
+
+    ranked.sort(
+        key=lambda item: (
+            item[0],
+            -item[1],
+        ),
+        reverse=True,
+    )
+
+    selected: List[DatabaseRow] = []
+
+    total_chars = 0
+
+    for score, _, summary in ranked:
+
+        # If the current message contains useful search terms, avoid
+        # injecting unrelated old conversations solely due to recency.
+        if query_terms and score <= 1.0:
+            continue
+
+        text = str(
+            summary.get("summary_text") or ""
+        ).strip()
+
+        remaining = (
+            CROSS_CONVERSATION_SUMMARY_MAX_CHARS
+            - total_chars
+        )
+
+        if remaining <= 0:
+            break
+
+        if len(text) > remaining:
+            text = text[:remaining].rstrip()
+
+        selected.append(
+            {
+                **summary,
+                "summary_text": text,
+            }
+        )
+
+        total_chars += len(text)
+
+        if len(selected) >= limit:
+            break
+
+    return selected
+
+def _get_conversation_summary_sync(
+    user_id: int,
+    conversation_id: Optional[str],
+) -> Optional[DatabaseRow]:
+
+    if not conversation_id:
+        return None
+
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT
+                conversation_id,
+                summary_text,
+                summarized_through_message_id,
+                updated_at
+            FROM conversation_summaries
+            WHERE user_id = %s
+              AND conversation_id = %s
+            LIMIT 1
+            """,
+            (
+                user_id,
+                conversation_id,
+            ),
+        ).fetchone()
+
+
+async def get_conversation_summary(
+    user_id: int,
+    conversation_id: Optional[str],
+) -> Optional[DatabaseRow]:
+
+    return await run_db(
+        _get_conversation_summary_sync,
+        user_id,
+        conversation_id,
+    )
+    
+def _conversation_summary_source_sync(
+    user_id: int,
+    conversation_id: str,
+    keep_recent: int,
+) -> dict:
+
+    with get_conn() as conn:
+        summary_row = conn.execute(
+            """
+            SELECT
+                summary_text,
+                summarized_through_message_id
+            FROM conversation_summaries
+            WHERE user_id = %s
+              AND conversation_id = %s
+            LIMIT 1
+            """,
+            (
+                user_id,
+                conversation_id,
+            ),
+        ).fetchone()
+
+        previous_summary = (
+            summary_row["summary_text"]
+            if summary_row is not None
+            else ""
+        )
+
+        summarized_through = (
+            int(
+                summary_row[
+                    "summarized_through_message_id"
+                ]
+            )
+            if summary_row is not None
+            else 0
+        )
+
+        recent_cutoff = conn.execute(
+            """
+            SELECT id
+            FROM conversation_messages
+            WHERE user_id = %s
+              AND conversation_id = %s
+            ORDER BY id DESC
+            OFFSET %s
+            LIMIT 1
+            """,
+            (
+                user_id,
+                conversation_id,
+                keep_recent,
+            ),
+        ).fetchone()
+
+        if recent_cutoff is None:
+            return {
+                "previous_summary": previous_summary,
+                "messages": [],
+                "summarized_through": summarized_through,
+            }
+
+        cutoff_id = int(
+            recent_cutoff["id"]
+        )
+
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                role,
+                content
+            FROM conversation_messages
+            WHERE user_id = %s
+              AND conversation_id = %s
+              AND id > %s
+              AND id <= %s
+            ORDER BY id ASC
+            """,
+            (
+                user_id,
+                conversation_id,
+                summarized_through,
+                cutoff_id,
+            ),
+        ).fetchall()
+
+    return {
+        "previous_summary": previous_summary,
+        "messages": [
+            dict(row)
+            for row in rows
+        ],
+        "summarized_through": summarized_through,
+    }
+    
+def _save_conversation_summary_sync(
+    user_id: int,
+    conversation_id: str,
+    summary_text: str,
+    summarized_through_message_id: int,
+) -> None:
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO conversation_summaries (
+                conversation_id,
+                user_id,
+                summary_text,
+                summarized_through_message_id
+            )
+            VALUES (
+                %s,
+                %s,
+                %s,
+                %s
+            )
+
+            ON CONFLICT (conversation_id)
+            DO UPDATE SET
+                summary_text =
+                    EXCLUDED.summary_text,
+
+                summarized_through_message_id =
+                    GREATEST(
+                        conversation_summaries.summarized_through_message_id,
+                        EXCLUDED.summarized_through_message_id
+                    ),
+
+                updated_at =
+                    CURRENT_TIMESTAMP
+            """,
+            (
+                conversation_id,
+                user_id,
+                summary_text,
+                summarized_through_message_id,
+            ),
+        )
+
+        conn.commit()
+        
+def _get_other_conversation_summaries_sync(
+    user_id: int,
+    current_conversation_id: Optional[str],
+    limit: int,
+) -> List[DatabaseRow]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                cs.conversation_id,
+                cs.summary_text,
+                cs.updated_at
+            FROM conversation_summaries cs
+            JOIN conversations c
+                ON c.id = cs.conversation_id
+            WHERE c.user_id = %s
+              AND cs.summary_text IS NOT NULL
+              AND TRIM(cs.summary_text) <> ''
+              AND (
+                    %s IS NULL
+                    OR cs.conversation_id <> %s
+                  )
+            ORDER BY cs.updated_at DESC
+            LIMIT %s
+            """,
+            (
+                user_id,
+                current_conversation_id,
+                current_conversation_id,
+                limit,
+            ),
+        ).fetchall()
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+
+async def get_other_conversation_summaries(
+    user_id: int,
+    current_conversation_id: Optional[str],
+    limit: int = CROSS_CONVERSATION_SUMMARY_CANDIDATES,
+) -> List[DatabaseRow]:
+    return await run_db(
+        _get_other_conversation_summaries_sync,
+        user_id,
+        current_conversation_id,
+        limit,
+    )
+    
+def _trim_text(
+    value: Optional[str],
+    max_chars: int,
+) -> str:
+
+    text = str(value or "").strip()
+
+    if not text or max_chars <= 0:
+        return ""
+
+    if len(text) <= max_chars:
+        return text
+
+    return text[:max_chars].rstrip()
+
+def _trim_lines_to_budget(
+    lines: List[str],
+    max_chars: int,
+) -> List[str]:
+
+    if max_chars <= 0:
+        return []
+
+    result: List[str] = []
+    used = 0
+
+    for line in lines:
+        text = str(line).strip()
+
+        if not text:
+            continue
+
+        remaining = max_chars - used
+
+        if remaining <= 0:
+            break
+
+        if len(text) > remaining:
+            text = text[:remaining].rstrip()
+
+        if text:
+            result.append(text)
+            used += len(text)
+
+    return result
+
+def _export_user_data_sync(
+    user_id: int,
+) -> dict:
+    with get_conn() as conn:
+
+        profile = conn.execute(
+            """
+            SELECT *
+            FROM user_profiles
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        ).fetchone()
+
+        conversations = conn.execute(
+            """
+            SELECT *
+            FROM conversations
+            WHERE user_id = %s
+            ORDER BY created_at ASC
+            """,
+            (user_id,),
+        ).fetchall()
+
+        messages = conn.execute(
+            """
+            SELECT *
+            FROM conversation_messages
+            WHERE user_id = %s
+            ORDER BY created_at ASC
+            """,
+            (user_id,),
+        ).fetchall()
+
+        memories = conn.execute(
+            """
+            SELECT *
+            FROM user_memories
+            WHERE user_id = %s
+            ORDER BY created_at ASC
+            """,
+            (user_id,),
+        ).fetchall()
+
+        measurements = conn.execute(
+            """
+            SELECT *
+            FROM screening_measurements
+            WHERE user_id = %s
+            ORDER BY created_at ASC
+            """,
+            (user_id,),
+        ).fetchall()
+
+        reports = conn.execute(
+            """
+            SELECT *
+            FROM wellbeing_reports
+            WHERE user_id = %s
+            ORDER BY created_at ASC
+            """,
+            (user_id,),
+        ).fetchall()
+
+    return {
+        "profile": dict(profile) if profile else None,
+        "conversations": [
+            dict(row) for row in conversations
+        ],
+        "messages": [
+            dict(row) for row in messages
+        ],
+        "memories": [
+            dict(row) for row in memories
+        ],
+        "assessment_measurements": [
+            dict(row) for row in measurements
+        ],
+        "reports": [
+            dict(row) for row in reports
+        ],
+    }
+
+def _delete_conversation_sync(
+    user_id: int,
+    conversation_id: str,
+) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM conversations
+            WHERE user_id = %s
+              AND id = %s
+            LIMIT 1
+            """,
+            (
+                user_id,
+                conversation_id,
+            ),
+        ).fetchone()
+
+        if row is None:
+            return False
+
+        conn.execute(
+            """
+            DELETE FROM user_memories
+            WHERE user_id = %s
+              AND source_conversation_id = %s
+            """,
+            (
+                user_id,
+                conversation_id,
+            ),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM conversation_summaries
+            WHERE user_id = %s
+              AND conversation_id = %s
+            """,
+            (
+                user_id,
+                conversation_id,
+            ),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM conversation_messages
+            WHERE user_id = %s
+              AND conversation_id = %s
+            """,
+            (
+                user_id,
+                conversation_id,
+            ),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM conversations
+            WHERE user_id = %s
+              AND id = %s
+            """,
+            (
+                user_id,
+                conversation_id,
+            ),
+        )
+
+        conn.commit()
+
+    return True
+
+def _delete_all_conversations_sync(
+    user_id: int,
+) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM conversations
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        ).fetchone()
+
+        total = int(
+            row["total"]
+            if row
+            else 0
+        )
+
+        conn.execute(
+            """
+            DELETE FROM user_memories
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM conversation_summaries
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM conversation_messages
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM conversations
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+
+        conn.commit()
+
+    return total
+
+def _delete_saved_reports_sync(
+    user_id: int,
+) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM wellbeing_reports
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        ).fetchone()
+
+        deleted_count = int(
+            row["total"] if row else 0
+        )
+
+        conn.execute(
+            """
+            DELETE FROM wellbeing_reports
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+
+        conn.commit()
+
+    return deleted_count
+
+def _delete_account_sync(user_id: int) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            # ---------------------------------------------------------
+            # Screening children first
+            # ---------------------------------------------------------
+
+            cur.execute(
+                """
+                DELETE FROM screening_session_items
+                WHERE session_id IN (
+                    SELECT session_id
+                    FROM screening_sessions
+                    WHERE user_id = %s
+                )
+                """,
+                (user_id,),
+            )
+
+            # Measurements may reference screening sessions.
+            cur.execute(
+                """
+                DELETE FROM screening_measurements
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+
+            cur.execute(
+                """
+                DELETE FROM screening_sessions
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+
+            # ---------------------------------------------------------
+            # Conversation-derived data
+            # ---------------------------------------------------------
+
+            cur.execute(
+                """
+                DELETE FROM conversation_summaries
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+
+            cur.execute(
+                """
+                DELETE FROM user_memories
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+
+            cur.execute(
+                """
+                DELETE FROM conversation_messages
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+
+            cur.execute(
+                """
+                DELETE FROM conversations
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+
+            # ---------------------------------------------------------
+            # Wellbeing/analytics data
+            # ---------------------------------------------------------
+
+            user_owned_tables = (
+                "assessment_records",
+                "check_ins",
+                "functional_impairments",
+                "sleep_reports",
+                "weekly_summaries",
+                "risk_assessments",
+                "recommendation_records",
+                "follow_ups",
+                "escalation_records",
+                "wellbeing_reports",
+                "resource_favorites",
+                "suggested_states",
+                "questionnaire_state",
+                "emotion_records",
+                "user_profiles",
+            )
+
+            for table in user_owned_tables:
+                cur.execute(
+                    f"DELETE FROM {table} WHERE user_id = %s",
+                    (user_id,),
+                )
+
+            # ---------------------------------------------------------
+            # Authentication/privacy data
+            # ---------------------------------------------------------
+
+            cur.execute(
+                """
+                DELETE FROM auth_sessions
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+
+            # Add your actual privacy acknowledgement table here if
+            # it has user_id and isn't already ON DELETE CASCADE.
+
+            # ---------------------------------------------------------
+            # User LAST
+            # ---------------------------------------------------------
+
+            cur.execute(
+                """
+                DELETE FROM users
+                WHERE id = %s
+                """,
+                (user_id,),
+            )
+
+        conn.commit()
+
+def format_profile_for_llm(
+    profile: Optional[dict],
+) -> List[str]:
+
+    if not profile:
+        return []
+
+    lines: List[str] = []
+
+    display_name = (
+        profile.get("display_name")
+        or profile.get("username")
+    )
+
+    if display_name:
+        lines.append(
+            f"name: {display_name}"
+        )
+
+    preferred_language = (
+        profile.get(
+            "preferred_language"
+        )
+    )
+
+    if preferred_language:
+        lines.append(
+            "stored_preferred_language: "
+            f"{preferred_language}"
+        )
+
+    return lines
+
+def format_memories_for_llm(
+    memories: List[dict],
+) -> List[str]:
+
+    return [
+        (
+            f"- [{memory['memory_type']}] "
+            f"{memory['memory_value']}"
+        )
+        for memory in memories
+    ]
 
 def _save_analysis_observations_sync(
     user_id: int,
@@ -2263,6 +3820,7 @@ def _store_suggested_sync(
         conn.commit()
 
 
+
 # ---------------------------------------------------------------------------
 # Weekly summary generation (aggregates now source from completed measurements)
 # ---------------------------------------------------------------------------
@@ -2485,28 +4043,73 @@ def _store_weekly_summary_sync(
         return int(summary_id)
 
 
-def _resolve_week(week_start=None, week_end=None) -> tuple[str, str]:
+def _resolve_week(
+    week_start=None,
+    week_end=None,
+) -> tuple[str, str]:
+
     if week_start and week_end:
-        pair = (week_start, week_end)
+        start = date.fromisoformat(week_start)
+        end = date.fromisoformat(week_end)
+
     elif week_start:
-        s = date.fromisoformat(week_start)
-        pair = (week_start, (s + timedelta(days=6)).isoformat())
+        start = date.fromisoformat(week_start)
+        end = start + timedelta(days=6)
+
     elif week_end:
-        e = date.fromisoformat(week_end)
-        pair = ((e - timedelta(days=6)).isoformat(), week_end)
+        end = date.fromisoformat(week_end)
+        start = end - timedelta(days=6)
+
     else:
-        today = datetime.now(timezone.utc).date()
-        pair = ((today - timedelta(days=6)).isoformat(), today.isoformat())
-    a, b = date.fromisoformat(pair[0]), date.fromisoformat(pair[1])
-    if b < a:
-        raise ValueError("week_end is before week_start")
-    return pair
+        today = datetime.now(
+            REPORTING_TIMEZONE
+        ).date()
+
+        # Monday → Sunday reporting week
+        start = today - timedelta(
+            days=today.weekday()
+        )
+
+        end = start + timedelta(days=6)
+
+    if end < start:
+        raise ValueError(
+            "week_end is before week_start"
+        )
+
+    if (end - start).days != 6:
+        raise ValueError(
+            "Reporting period must be exactly 7 days."
+        )
+
+    return (
+        start.isoformat(),
+        end.isoformat(),
+    )
 
 
-def _utc_day_bounds(start_date: str, end_date: str) -> tuple[datetime, datetime]:
-    start = datetime.combine(date.fromisoformat(start_date), datetime.min.time(), tzinfo=timezone.utc)
-    end = datetime.combine(date.fromisoformat(end_date) + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
-    return start, end
+def _utc_day_bounds(
+    start_date: str,
+    end_date: str,
+) -> tuple[datetime, datetime]:
+
+    start_local = datetime.combine(
+        date.fromisoformat(start_date),
+        datetime.min.time(),
+        tzinfo=REPORTING_TIMEZONE,
+    )
+
+    end_local = datetime.combine(
+        date.fromisoformat(end_date)
+        + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=REPORTING_TIMEZONE,
+    )
+
+    return (
+        start_local.astimezone(timezone.utc),
+        end_local.astimezone(timezone.utc),
+    )
 
 
 def _weekly_averages_sync(user_id: int, week_start: str, week_end: str) -> dict:
@@ -2546,6 +4149,30 @@ def interpret_weekly_average(scale: str, average: Optional[float]) -> Optional[s
         return _PSS10_LABELS[_pss10_band(rounded)]
     return None
 
+def interpret_assessment_total(
+    scale: str,
+    total: Optional[int],
+) -> Optional[str]:
+
+    if total is None:
+        return None
+
+    if scale == "PHQ-9":
+        return _PHQ9_LABELS[
+            _phq9_band(total)
+        ]
+
+    if scale == "GAD-7":
+        return _GAD7_LABELS[
+            _gad7_band(total)
+        ]
+
+    if scale == "PSS-10":
+        return _PSS10_LABELS[
+            _pss10_band(total)
+        ]
+
+    return None
 
 def build_weekly_aggregate(averages: dict) -> WeeklyAggregate:
     interpretation = {}
@@ -2795,16 +4422,48 @@ async def store_recommendation(user_id, category, text) -> int:
     return await run_db(_store_recommendation_sync, user_id, category, text)
 
 
-def _list_recommendations_sync(user_id, limit) -> List[DatabaseRow]:
+def _list_recommendations_sync(
+    user_id: int,
+    limit: int,
+    before_id: Optional[int] = None,
+) -> List[DatabaseRow]:
     with get_conn() as conn:
+        if before_id is not None:
+            return conn.execute(
+                """
+                SELECT id, category, text, timestamp
+                FROM recommendation_records
+                WHERE user_id = %s
+                  AND id < %s
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (user_id, before_id, limit),
+            ).fetchall()
+
         return conn.execute(
-            "SELECT id, category, text, timestamp FROM recommendation_records WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+            """
+            SELECT id, category, text, timestamp
+            FROM recommendation_records
+            WHERE user_id = %s
+            ORDER BY id DESC
+            LIMIT %s
+            """,
             (user_id, limit),
         ).fetchall()
 
 
-async def list_recommendations(user_id, limit=50) -> List[DatabaseRow]:
-    return await run_db(_list_recommendations_sync, user_id, limit)
+async def list_recommendations(
+    user_id: int,
+    limit: int = 50,
+    before_id: Optional[int] = None,
+) -> List[DatabaseRow]:
+    return await run_db(
+        _list_recommendations_sync,
+        user_id,
+        limit,
+        before_id,
+    )
 
 
 build_recommendations = (
@@ -2998,55 +4657,247 @@ async def get_pending_score_items(user_id: int, include_paused: bool = True) -> 
 # ---------------------------------------------------------------------------
 
 async def build_llm_context(
-    user_id, current_message, preferred_language, sleep_hours, deepface_emotion,
-    active_question=None, conversation_id=None,
+    user_id,
+    current_message,
+    preferred_language,
+    sleep_hours,
+    deepface_emotion,
+    active_question=None,
+    conversation_id=None,
 ) -> List[dict]:
-    recent, summaries, snapshot, pending, trends = await asyncio.gather(
-        get_recent_messages(user_id, conversation_id=conversation_id),
-        get_recent_weekly_summaries(user_id),
-        get_latest_assessment_snapshot(user_id),
-        get_pending_score_items(user_id, include_paused=False),
-        compute_four_week_trends(user_id),
+
+    (
+        recent,
+        summaries,
+        snapshot,
+        pending,
+        trends,
+        profile,
+        memories,
+        conversation_summary,
+        other_conversation_summaries,
+    ) = await asyncio.gather(
+        get_recent_messages(
+            user_id,
+            conversation_id=conversation_id,
+        ),
+        get_recent_weekly_summaries(
+            user_id
+        ),
+        get_latest_assessment_snapshot(
+            user_id
+        ),
+        get_pending_score_items(
+            user_id,
+            include_paused=False,
+        ),
+        compute_four_week_trends(
+            user_id
+        ),
+        get_llm_profile(
+            user_id
+        ),
+        get_user_memories(
+            user_id,
+            limit=30,
+        ),
+        get_conversation_summary(
+            user_id,
+            conversation_id,
+        ),
+        get_other_conversation_summaries(
+            user_id,
+            conversation_id,
+        ),
+    )
+
+    relevant_memories = select_relevant_memories(
+        memories,
+        current_message,
+        limit=6,
+    )
+    
+    relevant_conversation_summaries = (
+        select_relevant_conversation_summaries(
+            other_conversation_summaries,
+            current_message,
+            limit=CROSS_CONVERSATION_SUMMARY_LIMIT,
+        )
     )
 
     context_lines = [
-        "[PRIVATE BACKEND CONTEXT — not user-authored. Use it only when it changes "
-        "the current reply. Do not recap it, quote it, or treat it as a style template.]"
+        (
+            "[PRIVATE BACKEND CONTEXT — not user-authored. "
+            "Use it only when it changes the current reply. "
+            "Current-conversation context has priority over older conversation "
+            "summaries and long-term memory. Current user statements override "
+            "all historical context. Do not recap, quote, or expose this context.]"
+        )
     ]
+
+    profile_lines = _trim_lines_to_budget(
+        format_profile_for_llm(
+            profile
+        ),
+        PROFILE_CONTEXT_MAX_CHARS,
+    )
+
+    if profile_lines:
+        context_lines.append(
+            "user_profile:"
+        )
+
+        context_lines.extend(
+            f"- {line}"
+            for line in profile_lines
+        )
+
+    memory_lines = _trim_lines_to_budget(
+        format_memories_for_llm(
+            relevant_memories
+        ),
+        MEMORY_CONTEXT_MAX_CHARS,
+    )
+
+    if memory_lines:
+        context_lines.append(
+            "relevant_long_term_memory:"
+        )
+
+        context_lines.extend(
+            memory_lines
+        )
+        
+    if conversation_summary:
+        summary_text = _trim_text(
+            conversation_summary.get(
+                "summary_text"
+            ),
+            CURRENT_SUMMARY_MAX_CHARS,
+        )
+
+        if summary_text:
+            context_lines.append(
+                "older_current_conversation_summary:"
+            )
+
+            context_lines.append(
+                summary_text
+            )
+            
+    if relevant_conversation_summaries:
+        context_lines.append(
+            "relevant_previous_conversations:"
+        )
+
+        for old_summary in relevant_conversation_summaries:
+            summary_text = str(
+                old_summary.get("summary_text") or ""
+            ).strip()
+
+            if summary_text:
+                context_lines.append(
+                    f"- {summary_text}"
+                )
+
     if preferred_language:
-        context_lines.append(f"preferred_language: {preferred_language}")
+        context_lines.append(
+            f"preferred_language: {preferred_language}"
+        )
+
     if active_question is not None:
         context_lines.append(
             f"current_follow_up_target: scale={active_question['scale']} "
             f"item={active_question['item_id']} -> previous question: "
-            f"\"{active_question['question_text']}\". Interpret the user's reply as the "
-            "answer when it provides frequency; otherwise continue naturally."
+            f"\"{active_question['question_text']}\". "
+            "Interpret the user's reply as the answer when it provides "
+            "frequency; otherwise continue naturally."
         )
+
     if summaries:
-        context_lines.append("weekly_summaries (oldest to newest):")
-        for s in summaries:
-            context_lines.append(f"- {s['week_start']} to {s['week_end']}: {s['summary_text']}")
-    if any(snapshot[k] for k in snapshot):
-        context_lines.append(f"latest_structured_assessment_snapshot: {snapshot}")
+        context_lines.append(
+            "weekly_summaries (oldest to newest):"
+        )
+
+        for summary in summaries:
+            context_lines.append(
+                f"- {summary['week_start']} to "
+                f"{summary['week_end']}: "
+                f"{summary['summary_text']}"
+            )
+
+    if any(snapshot[key] for key in snapshot):
+        context_lines.append(
+            "latest_structured_assessment_snapshot: "
+            f"{snapshot}"
+        )
+
     if any(trends.values()):
-        context_lines.append("four_week_screening_trends (backend analysis, not a diagnosis): "
-                             f"{ {k: v for k, v in trends.items() if v} }")
+        filtered_trends = {
+            key: value
+            for key, value in trends.items()
+            if value
+        }
+
+        context_lines.append(
+            "four_week_screening_trends "
+            "(backend analysis, not a diagnosis): "
+            f"{filtered_trends}"
+        )
+
     if pending:
         context_lines.append(
-            "items_with_evidence_but_no_frequency_yet (ask naturally about the frequency of "
-            f"AT MOST one item when it fits; never run the full questionnaire): {pending}"
+            "items_with_evidence_but_no_frequency_yet "
+            "(ask naturally about the frequency of AT MOST one item "
+            "when it fits; never run the full questionnaire): "
+            f"{pending}"
         )
+
     if sleep_hours is not None:
-        context_lines.append(f"sleep_hours_reported_this_turn: {sleep_hours}")
+        context_lines.append(
+            f"sleep_hours_reported_this_turn: {sleep_hours}"
+        )
+
     if deepface_emotion:
         context_lines.append(
-            "optional_visual_emotion_signal (context only, NOT a symptom or diagnosis): "
+            "optional_visual_emotion_signal "
+            "(context only, NOT a symptom or diagnosis): "
             + deepface_emotion
         )
-    messages: List[dict] = [{"role": "system", "content": "\n".join(context_lines)}]
+        
+    private_context = "\n".join(
+        context_lines
+    )
+
+    if len(private_context) > PRIVATE_CONTEXT_MAX_CHARS:
+        private_context = (
+            private_context[
+                :PRIVATE_CONTEXT_MAX_CHARS
+            ].rstrip()
+        )
+
+    messages: List[dict] = [
+        {
+            "role": "system",
+            "content": private_context,
+        }
+    ]
+
     for row in recent:
-        messages.append({"role": row["role"], "content": row["content"]})
-    messages.append({"role": "user", "content": current_message})
+        messages.append(
+            {
+                "role": row["role"],
+                "content": row["content"],
+            }
+        )
+
+    messages.append(
+        {
+            "role": "user",
+            "content": current_message,
+        }
+    )
+
     return messages
 
 
@@ -3074,6 +4925,223 @@ def get_gemini_client():
 
     return _client
 
+async def extract_memory_candidates(
+    user_message: str,
+) -> MemoryExtraction:
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                get_gemini_client().models.generate_content,
+                model=GEMINI_MODEL,
+                contents=(
+                    MEMORY_EXTRACTION_PROMPT
+                    + "\n\n"
+                    + "CURRENT USER MESSAGE:\n"
+                    + user_message
+                ),
+                config=types.GenerateContentConfig(
+                    response_mime_type=
+                        "application/json",
+                    response_schema=
+                        MemoryExtraction,
+                ),
+            ),
+            timeout=min(
+                GEMINI_TIMEOUT_SECONDS,
+                10.0,
+            ),
+        )
+
+    except TimeoutError:
+        logger.info(
+            "Memory extraction timed out; "
+            "continuing without memory update."
+        )
+
+        return MemoryExtraction()
+
+    except Exception as exc:
+        logger.warning(
+            "Memory extraction skipped: %s",
+            type(exc).__name__,
+        )
+
+        return MemoryExtraction()
+
+    if not response.text:
+        return MemoryExtraction()
+
+    try:
+        return (
+            MemoryExtraction
+            .model_validate_json(
+                response.text
+            )
+        )
+
+    except Exception as exc:
+        logger.warning(
+            "Memory extraction parsing "
+            "failed: %s",
+            type(exc).__name__,
+        )
+
+        return MemoryExtraction()
+    
+async def update_conversation_summary(
+    user_id: int,
+    conversation_id: str,
+) -> None:
+
+    try:
+        source = await run_db(
+            _conversation_summary_source_sync,
+            user_id,
+            conversation_id,
+            MAX_RECENT_MESSAGES,
+        )
+
+        messages = source["messages"]
+
+        if (
+            len(messages)
+            < CONVERSATION_SUMMARY_MIN_NEW_MESSAGES
+        ):
+            return
+
+        source_parts: List[str] = []
+
+        previous_summary = (
+            source.get("previous_summary")
+            or ""
+        ).strip()
+
+        if previous_summary:
+            source_parts.append(
+                "EXISTING SUMMARY:\n"
+                + previous_summary
+            )
+
+        source_parts.append(
+            "NEW OLDER MESSAGES:"
+        )
+
+        used_chars = 0
+        included_messages: List[dict] = []
+
+        for row in messages:
+            content = str(
+                row.get("content") or ""
+            ).strip()
+
+            if not content:
+                continue
+
+            formatted = (
+                f"{row['role'].upper()}: "
+                f"{content}"
+            )
+
+            if (
+                used_chars
+                + len(formatted)
+                > CONVERSATION_SUMMARY_MAX_SOURCE_CHARS
+            ):
+                break
+
+            source_parts.append(
+                formatted
+            )
+
+            included_messages.append(
+                row
+            )
+
+            used_chars += len(
+                formatted
+            )
+
+        if not included_messages:
+            return
+
+        prompt = (
+            CONVERSATION_SUMMARY_PROMPT
+            + "\n\n"
+            + "\n".join(source_parts)
+        )
+
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                get_gemini_client()
+                .models
+                .generate_content,
+                model=GEMINI_MODEL,
+                contents=prompt,
+            ),
+            timeout=min(
+                GEMINI_TIMEOUT_SECONDS,
+                12.0,
+            ),
+        )
+
+        summary_text = (
+            response.text or ""
+        ).strip()
+
+        if not summary_text:
+            return
+
+        last_message_id = int(
+            included_messages[-1]["id"]
+        )
+
+        await run_db(
+            _save_conversation_summary_sync,
+            user_id,
+            conversation_id,
+            summary_text,
+            last_message_id,
+        )
+
+    except TimeoutError:
+        logger.info(
+            "Conversation summary update timed out "
+            "for conversation %s.",
+            conversation_id,
+        )
+
+    except Exception as exc:
+        logger.warning(
+            "Conversation summary update skipped "
+            "for %s: %s",
+            conversation_id,
+            type(exc).__name__,
+        )
+    
+async def remember_from_message(
+    user_id: int,
+    conversation_id: str,
+    user_message: str,
+) -> None:
+
+    extraction = (
+        await extract_memory_candidates(
+            user_message
+        )
+    )
+
+    for memory in extraction.memories[:5]:
+
+        if memory.confidence < 0.75:
+            continue
+
+        await upsert_user_memory(
+            user_id=user_id,
+            memory=memory,
+            conversation_id=
+                conversation_id,
+        )    
 
 # ---------------------------------------------------------------------------
 # Voice transcription (raw audio never retained)
@@ -3182,9 +5250,30 @@ async def transcribe_audio(
     
 @app.get("/health")
 async def health():
+    try:
+        db_ok = await asyncio.wait_for(
+            run_db(_health_db_sync),
+            timeout=5.0,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Health check database failure: %s",
+            type(exc).__name__,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "degraded",
+                "service": "gaash-bot",
+                "database": "unavailable",
+            },
+        ) from exc
+
     return {
         "status": "ok",
-        "service": "gaash-bot"
+        "service": "gaash-bot",
+        "database": "ok" if db_ok else "unavailable",
     }
     
 # ---------------------------------------------------------------------------
@@ -3301,6 +5390,7 @@ async def update_profile(
 async def chat(
     payload: ChatRequest,
     http_request: Request,
+    background_tasks: BackgroundTasks,
     user_id: int = Depends(get_current_user_id),
 ):
     enforce_rate_limit(http_request, "chat", limit=30, window_seconds=60)
@@ -3347,6 +5437,12 @@ async def chat(
             status_code=503,
             detail="AI service is temporarily unavailable. Please try again shortly.",
         )
+    background_tasks.add_task(
+        remember_from_message,
+        user_id,
+        conversation_id,
+        message_text,
+    )
 
     # Save passive evidence separately from deliberate sessions.  A chat turn
     # must not start or alter a PHQ-9/GAD-7/PSS-10 questionnaire lifecycle.
@@ -3361,7 +5457,11 @@ async def chat(
             for item in validate_symptom_items(scale, items)
             if item.score is not None
         )
-    await save_passive_screening_evidence(user_id, passive_observations)
+    background_tasks.add_task(
+        save_passive_screening_evidence,
+        user_id,
+        passive_observations,
+    )
 
     emergency = bool(analysis.emergency_flag)
 
@@ -3388,6 +5488,12 @@ async def chat(
         reply,
         conversation_id,
     )
+    
+    background_tasks.add_task(
+        update_conversation_summary,
+        user_id,
+        conversation_id,
+    )
 
     totals = await get_latest_finalized_totals(user_id)
 
@@ -3411,13 +5517,55 @@ async def chat(
         emergency=emergency,
     )
 
-    pending_raw = await get_pending_score_items(user_id)
 
     pending = {
         "PHQ-9": [],
         "GAD-7": [],
         "PSS-10": [],
     }
+    
+    primary_emotion = (
+        analysis.primary_emotion or ""
+    ).strip() or None
+
+    emotion_severity = (
+        analysis.emotion_severity or ""
+    ).strip() or None
+
+
+    async def save_current_emotion():
+        if primary_emotion:
+            await save_emotion(
+                user_id,
+                conversation_id,
+                "text",
+                primary_emotion,
+                analysis.emotion_confidence,
+                emotion_severity,
+            )
+
+        elif payload.deepface_emotion:
+            await save_emotion(
+                user_id,
+                conversation_id,
+                "visual",
+                payload.deepface_emotion.strip(),
+                None,
+                None,
+            )
+
+
+    pending_raw, _, _ = await asyncio.gather(
+        get_pending_score_items(user_id),
+
+        save_current_emotion(),
+
+        save_analysis_observations(
+            user_id,
+            analysis.sleep_hours_reported,
+            analysis.functional_impairments,
+        ),
+    )
 
     for item in pending_raw:
         scale = item.get("scale")
@@ -3428,31 +5576,6 @@ async def chat(
             
     primary_emotion = (analysis.primary_emotion or "").strip() or None
     emotion_severity = (analysis.emotion_severity or "").strip() or None
-    if primary_emotion:
-        await save_emotion(
-            user_id,
-            conversation_id,
-            "text",
-            primary_emotion,
-            analysis.emotion_confidence,
-            emotion_severity,
-        )
-
-    elif payload.deepface_emotion:
-        await save_emotion(
-            user_id,
-            conversation_id,
-            "visual",
-            payload.deepface_emotion.strip(),
-            None,
-            None,
-        )
-
-    await save_analysis_observations(
-        user_id,
-        analysis.sleep_hours_reported,
-        analysis.functional_impairments,
-    )
 
     if emergency:
         await save_risk_assessment(user_id, risk_details, totals)
@@ -3596,6 +5719,62 @@ async def get_conversation(
         "limit": limit,
         "has_more": has_more,
         "next_before_id": next_before_id,
+    }
+
+@app.delete(
+    "/conversations/{conversation_id}",
+    response_model=StatusResponse,
+)
+async def delete_conversation(
+    conversation_id: str,
+    http_request: Request,
+    user_id: int = Depends(get_current_user_id),
+):
+    enforce_rate_limit(
+        http_request,
+        "conversation-delete",
+        limit=20,
+        window_seconds=600,
+    )
+
+    deleted = await run_db(
+        _delete_conversation_sync,
+        user_id,
+        conversation_id,
+    )
+
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found.",
+        )
+
+    return {
+        "status": "deleted"
+    }
+
+@app.delete(
+    "/conversations",
+    response_model=StatusResponse,
+)
+async def delete_all_conversations(
+    http_request: Request,
+    user_id: int = Depends(get_current_user_id),
+):
+    enforce_rate_limit(
+        http_request,
+        "conversation-delete-all",
+        limit=5,
+        window_seconds=600,
+    )
+
+    deleted_count = await run_db(
+        _delete_all_conversations_sync,
+        user_id,
+    )
+
+    return {
+        "status": "deleted"
     }
 
 # ---------------------------------------------------------------------------
@@ -3817,6 +5996,8 @@ async def get_analytics(
         totals,
     )
     snapshot = await get_analytics_snapshot(user_id, days)
+    period_end = datetime.now(timezone.utc)
+    period_start = period_end - timedelta(days=days)
 
     return {
         "screening_totals": totals,
@@ -3824,6 +6005,8 @@ async def get_analytics(
         "four_week_trends": trends,
         "trajectory": trajectory,
         "period_days": days,
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
         **snapshot,
     }
 
@@ -3862,7 +6045,7 @@ async def wellbeing_report(
             {
                 "assessment_type": row["assessment_type"],
                 "total": row["total"],
-                "severity": interpret_weekly_average(row["assessment_type"], float(row["total"])),
+                "severity": interpret_assessment_total(row["assessment_type"], int(row["total"])),
                 "completed_at": row["completed_at"],
             }
             for row in measurements
@@ -3876,7 +6059,49 @@ async def wellbeing_report(
         "safety_status": "screening results are not a diagnosis",
     }
 
+@app.get("/account/export")
+async def export_user_data(
+    http_request: Request,
+    user_id: int = Depends(get_current_user_id),
+):
+    enforce_rate_limit(
+        http_request,
+        "account-export",
+        limit=3,
+        window_seconds=3600,
+    )
 
+    data = await run_db(
+        _export_user_data_sync,
+        user_id,
+    )
+
+    return data
+
+@app.delete(
+    "/reports",
+    response_model=StatusResponse,
+)
+async def delete_saved_reports(
+    http_request: Request,
+    user_id: int = Depends(get_current_user_id),
+):
+    enforce_rate_limit(
+        http_request,
+        "report-delete",
+        limit=5,
+        window_seconds=600,
+    )
+
+    await run_db(
+        _delete_saved_reports_sync,
+        user_id,
+    )
+
+    return {
+        "status": "deleted"
+    }
+    
 # ---------------------------------------------------------------------------
 # WEEKLY SUMMARY
 # ---------------------------------------------------------------------------
@@ -3924,19 +6149,47 @@ async def weekly_summary(
 # RECOMMENDATIONS
 # ---------------------------------------------------------------------------
 
-@app.get("/recommendations", response_model=RecommendationsResponse)
+@app.get(
+    "/recommendations",
+    response_model=RecommendationsResponse,
+)
 async def recommendations(
     http_request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+    before_id: Optional[int] = Query(default=None, ge=1),
     user_id: int = Depends(get_current_user_id),
 ):
-    enforce_rate_limit(http_request, "recommendations", limit=60, window_seconds=600)
-    rows = await list_recommendations(user_id)
+    enforce_rate_limit(
+        http_request,
+        "recommendations",
+        limit=60,
+        window_seconds=600,
+    )
+
+    rows = await list_recommendations(
+        user_id,
+        limit + 1,
+        before_id,
+    )
+
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+
+    next_before_id = None
+
+    if has_more and page_rows:
+        next_before_id = int(
+            page_rows[-1]["id"]
+        )
 
     return {
         "recommendations": [
             dict(row)
-            for row in rows
-        ]
+            for row in page_rows
+        ],
+        "limit": limit,
+        "has_more": has_more,
+        "next_before_id": next_before_id,
     }
 
 
@@ -4045,6 +6298,30 @@ async def submit_screening_answer(
         "session_id": session_id,
         "scale": session["scale"],
         **result,
+    }
+
+@app.delete(
+    "/account",
+    response_model=StatusResponse,
+)
+async def delete_account(
+    http_request: Request,
+    user_id: int = Depends(get_current_user_id),
+):
+    enforce_rate_limit(
+        http_request,
+        "account-delete",
+        limit=3,
+        window_seconds=3600,
+    )
+
+    await run_db(
+        _delete_account_sync,
+        user_id,
+    )
+
+    return {
+        "status": "deleted"
     }
 
 if __name__ == "__main__":
