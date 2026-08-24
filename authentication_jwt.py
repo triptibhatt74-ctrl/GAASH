@@ -79,6 +79,7 @@ AUTH_SESSION_EXPIRE_DAYS = int(
 
 AUTH_SESSION_COOKIE_NAME = os.getenv(
     "AUTH_SESSION_COOKIE_NAME",
+    
     "gaash_session",
 )
 
