@@ -6071,8 +6071,6 @@ async def pause_screening(
     )
 
     if not success:
-        # Covers a rare race where session state changed between
-        # checking it and updating it.
         raise HTTPException(
             status_code=409,
             detail="Session state changed and could not be paused.",
@@ -6434,8 +6432,8 @@ async def voice_chat(
         )
 
     chat_payload = ChatRequest(
-        message=transcript,
-        conversationId=conversation_id,
+        user_message=transcript,
+        conversation_id=conversation_id,
         preferred_language=preferred_language,
         sleep_hours=sleep_hours,
         deepface_emotion=deepface_emotion,
@@ -6449,9 +6447,6 @@ async def voice_chat(
         user_id=user_id,
     )
 
-    # Transcript is returned so the frontend can
-    # keep it hidden and reveal it only when the
-    # user presses "Transcribe".
     return result.model_copy(
         update={
             "transcript": transcript,
