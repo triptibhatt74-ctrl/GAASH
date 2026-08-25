@@ -36,9 +36,8 @@ from google import genai
 from google.genai import types
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 from psycopg_pool import ConnectionPool
-# ---------------------------------------------------------------------------
+
 # Configuration
-# ---------------------------------------------------------------------------
 
 load_dotenv()
 
@@ -55,7 +54,6 @@ if not DATABASE_URL:
 
 RESOURCES_FILE = os.environ.get("RESOURCES_FILE", str(Path(__file__).resolve().parent / "resources.json"))
 
-# Must match GAASH_JWT_SECRET / algorithm used by authentication_jwt.py.
 JWT_SECRET = os.getenv("GAASH_JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 
@@ -130,14 +128,13 @@ except Exception as exc:
         f"Invalid REPORTING_TIMEZONE: "
         f"{REPORTING_TIMEZONE_NAME}"
     ) from exc
-# Analytics date-range guard: prevents unbounded table scans.
+
 MAX_ANALYTICS_DAYS = int(os.environ.get("MAX_ANALYTICS_DAYS", "400"))
 
 DATA_RETENTION_DAYS = max(
     30,
     int(os.getenv("DATA_RETENTION_DAYS", "365")),
 )
-
 
 SUPPORTED_AUDIO_MEDIA_TYPES = {
     "audio/mpeg", "audio/mp3", "audio/mp4", "audio/m4a", "audio/x-m4a",
@@ -628,7 +625,7 @@ def init_gaash_tables() -> None:
                     id BIGSERIAL PRIMARY KEY,
                     user_id BIGINT NOT NULL,
                     conversation_id TEXT,
-                    source TEXT NOT NULL CHECK (source IN ('text', 'visual')),
+                    source TEXT NOT NULL CHECK (source IN ('text', 'visual', 'voice')),
                     primary_emotion TEXT NOT NULL,
                     confidence DOUBLE PRECISION,
                     severity TEXT,
@@ -1348,6 +1345,19 @@ def validate_symptom_items(scale: str, items: List[SymptomItem]) -> List[Symptom
         cleaned.append(item)
     return cleaned
 
+class VoiceEmotionContext(BaseModel):
+    primary: Optional[str] = Field(
+        default=None,
+        max_length=40,
+    )
+    confidence: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+    )
+    intensity: Optional[
+        Literal["low", "moderate", "high"]
+    ] = None
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -1357,7 +1367,7 @@ class ChatRequest(BaseModel):
     preferred_language: Optional[str] = Field(default=None, max_length=20)
     sleep_hours: Optional[float] = Field(default=None, ge=0, le=24)
     deepface_emotion: Optional[str] = Field(default=None, max_length=80)
-
+    voice_emotion: Optional[VoiceEmotionContext] = None
 
 class ChatAnalytics(BaseModel):
     detected_language: str
@@ -1465,9 +1475,41 @@ class AnalyzeFrameResponse(BaseModel):
     error: Optional[str] = None
 
 
+class VoiceEmotionSignal(BaseModel):
+    primary: Optional[str] = None
+    confidence: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+    )
+    intensity: Optional[
+        Literal["low", "moderate", "high"]
+    ] = None
+
+
 class VoiceTranscriptionResponse(BaseModel):
     transcript: str
+    voice_emotion: Optional[
+        VoiceEmotionSignal
+    ] = None
 
+class VoiceAudioAnalysis(BaseModel):
+    transcript: str
+
+    primary_emotion: Optional[str] = Field(
+        default=None,
+        max_length=40,
+    )
+
+    emotion_confidence: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+    )
+
+    emotion_intensity: Optional[
+        Literal["low", "moderate", "high"]
+    ] = None
 
 class ApiErrorResponse(BaseModel):
     code: str
@@ -4680,6 +4722,7 @@ async def build_llm_context(
     preferred_language,
     sleep_hours,
     deepface_emotion,
+    voice_emotion=None,
     active_question=None,
     conversation_id=None,
 ) -> List[dict]:
@@ -4881,6 +4924,29 @@ async def build_llm_context(
             "optional_visual_emotion_signal "
             "(context only, NOT a symptom or diagnosis): "
             + deepface_emotion
+        )
+        
+    if voice_emotion and voice_emotion.primary:
+        voice_parts = [
+            f"primary={voice_emotion.primary}"
+        ]
+
+        if voice_emotion.confidence is not None:
+            voice_parts.append(
+                f"confidence={voice_emotion.confidence:.2f}"
+            ) 
+
+        if voice_emotion.intensity:
+            voice_parts.append(
+            f"intensity={voice_emotion.intensity}"
+            )
+
+        context_lines.append(
+            "optional_voice_emotion_signal "
+            "(contextual vocal cue only; NOT a symptom, "
+            "diagnosis, screening score, or independent "
+            "risk evidence): "
+            + ", ".join(voice_parts)
         )
         
     private_context = "\n".join(
@@ -5218,10 +5284,9 @@ def _is_uncertain_transcript(value: str) -> bool:
 async def transcribe_audio(
     audio_bytes: bytes,
     mime_type: str,
-) -> str:
-    try:
-        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+) -> VoiceAudioAnalysis:
 
+    try:
         response = await asyncio.wait_for(
             asyncio.to_thread(
                 get_gemini_client().models.generate_content,
@@ -5229,42 +5294,110 @@ async def transcribe_audio(
                 contents=[
                     {
                         "text": (
-                            "Transcribe this audio accurately. "
-                            "Preserve the speaker's original language and mixed-language "
-                            "speech such as Hindi, Hinglish, Urdu, Kashmiri, Dogri, or English. "
-                            "Return only the transcription, without commentary."
+                            "Analyze this voice recording for GAASH, "
+                            "a wellbeing conversational assistant.\n\n"
+
+                            "1. Transcribe the spoken words accurately.\n"
+                            "2. Preserve the speaker's original language "
+                            "and natural code-switching, including English, "
+                            "Hindi, Hinglish, Urdu, Kashmiri and Dogri.\n"
+                            "3. Using ONLY audible vocal cues such as tone, "
+                            "pace, energy and delivery, provide a cautious "
+                            "voice-emotion context signal when sufficiently "
+                            "supported.\n"
+                            "4. Do not diagnose mental-health conditions.\n"
+                            "5. Do not infer PHQ-9, GAD-7, PSS-10 scores, "
+                            "risk level, intent, personality or hidden facts "
+                            "from voice tone.\n"
+                            "6. If the emotion cannot be determined "
+                            "reliably, return null emotion fields.\n"
+                            "7. Emotion confidence must be conservative.\n\n"
+
+                            "The voice-emotion result is contextual metadata "
+                            "only. Spoken words remain the primary evidence."
                         )
                     },
-                    {
-                        "inline_data": {
-                            "mime_type": mime_type,
-                            "data": audio_b64,
-                        }
-                    },
+                    types.Part.from_bytes(
+                        data=audio_bytes,
+                        mime_type=mime_type,
+                    ),
                 ],
+                config=types.GenerateContentConfig(
+                    response_mime_type=
+                        "application/json",
+                    response_schema=
+                        VoiceAudioAnalysis,
+                ),
             ),
             timeout=GEMINI_TIMEOUT_SECONDS,
         )
 
     except TimeoutError as exc:
-        logger.warning("Gemini voice transcription timed out")
-        raise HTTPException(status_code=504, detail="Voice transcription timed out. Please try again.") from exc
-    except Exception as exc:
-        logger.warning("Gemini voice transcription failed: %s", type(exc).__name__)
+        logger.warning(
+            "Gemini voice analysis timed out"
+        )
         raise HTTPException(
-            status_code=502,
-            detail="Voice transcription service is temporarily unavailable.",
+            status_code=503,
+            detail=(
+                "Voice processing timed out. "
+                "Please try again."
+            ),
         ) from exc
 
-    text = (response.text or "").strip()
-
-    if _is_uncertain_transcript(text):
+    except Exception as exc:
+        logger.warning(
+            "Gemini voice analysis failed: %s",
+            type(exc).__name__,
+        )
         raise HTTPException(
-            status_code=422,
-            detail="Could not transcribe that recording clearly.",
+            status_code=503,
+            detail=(
+                "Voice processing is temporarily "
+                "unavailable."
+            ),
+        ) from exc
+
+    if not response.text:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Voice processing returned "
+                "no result."
+            ),
         )
 
-    return text
+    try:
+        result = (
+            VoiceAudioAnalysis
+            .model_validate_json(response.text)
+        )
+
+    except Exception as exc:
+        logger.warning(
+            "Voice structured output parsing failed: %s",
+            type(exc).__name__,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Voice processing returned "
+                "an invalid result."
+            ),
+        ) from exc
+
+    transcript = result.transcript.strip()
+
+    if _is_uncertain_transcript(transcript):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Speech could not be understood "
+                "clearly enough."
+            ),
+        )
+
+    return result
     
 @app.get("/health")
 async def health():
@@ -5441,6 +5574,7 @@ async def chat(
         preferred_language=payload.preferred_language,
         sleep_hours=payload.sleep_hours,
         deepface_emotion=payload.deepface_emotion,
+        voice_emotion=payload.voice_emotion,
     )
 
     # Persist the user turn before invoking the external model. A transient
@@ -5552,27 +5686,49 @@ async def chat(
 
 
     async def save_current_emotion():
+        tasks = []
+
         if primary_emotion:
-            await save_emotion(
-                user_id,
-                conversation_id,
-                "text",
-                primary_emotion,
-                analysis.emotion_confidence,
-                emotion_severity,
+            tasks.append(
+                save_emotion(
+                    user_id,
+                    conversation_id,
+                    "text",
+                    primary_emotion,
+                    analysis.emotion_confidence,
+                    emotion_severity,
+                )
             )
 
-        elif payload.deepface_emotion:
-            await save_emotion(
-                user_id,
-                conversation_id,
-                "visual",
-                payload.deepface_emotion.strip(),
-                None,
-                None,
+        if (
+            payload.voice_emotion
+            and payload.voice_emotion.primary
+        ):
+            tasks.append(
+                save_emotion(
+                    user_id,
+                    conversation_id,
+                    "voice",
+                    payload.voice_emotion.primary,
+                    payload.voice_emotion.confidence,
+                    payload.voice_emotion.intensity,
+                )
             )
 
+        if payload.deepface_emotion:
+            tasks.append(
+                save_emotion(
+                    user_id,
+                    conversation_id,
+                    "visual",
+                    payload.deepface_emotion.strip(),
+                    None,
+                    None,
+                )
+            )
 
+        if tasks:
+            await asyncio.gather(*tasks)
     pending_raw, _, _ = await asyncio.gather(
         get_pending_score_items(user_id),
 
@@ -5584,7 +5740,7 @@ async def chat(
             analysis.functional_impairments,
         ),
     )
-
+    
     for item in pending_raw:
         scale = item.get("scale")
         item_id = item.get("item_id")
@@ -6210,9 +6366,112 @@ async def recommendations(
         "next_before_id": next_before_id,
     }
 
-
-# ---------------------------------------------------------------------------
 # VOICE
+
+@app.post(
+    "/voice/chat",
+    response_model=ChatResponse,
+)
+async def voice_chat(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    audio: UploadFile = File(...),
+
+    conversation_id: Optional[str] = Form(
+        default=None
+    ),
+
+    preferred_language: Optional[str] = Form(
+        default=None
+    ),
+
+    sleep_hours: Optional[float] = Form(
+        default=None
+    ),
+
+    deepface_emotion: Optional[str] = Form(
+        default=None
+    ),
+
+    user_id: int = Depends(
+        get_current_user_id
+    ),
+):
+    enforce_rate_limit(
+        request,
+        "voice-chat",
+        limit=10,
+        window_seconds=600,
+    )
+
+    # Audio is sent to Gemini, so require the
+    # user's separate voice-processing consent.
+    require_voice_transcription_consent(
+        user_id
+    )
+
+    if (
+        preferred_language
+        and preferred_language
+        not in SUPPORTED_LANGUAGES
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported language.",
+        )
+
+    audio_bytes, mime_type = (
+        await read_validated_audio(audio)
+    )
+
+    voice_analysis = await transcribe_audio(
+        audio_bytes,
+        mime_type,
+    )
+
+    transcript = (
+        voice_analysis.transcript.strip()
+    )
+
+    voice_emotion = None
+
+    if voice_analysis.primary_emotion:
+        voice_emotion = VoiceEmotionContext(
+            primary=(
+                voice_analysis.primary_emotion
+            ),
+            confidence=(
+                voice_analysis.emotion_confidence
+            ),
+            intensity=(
+                voice_analysis.emotion_intensity
+            ),
+        )
+
+    chat_payload = ChatRequest(
+        message=transcript,
+        conversationId=conversation_id,
+        preferred_language=preferred_language,
+        sleep_hours=sleep_hours,
+        deepface_emotion=deepface_emotion,
+        voice_emotion=voice_emotion,
+    )
+
+    result = await chat(
+        payload=chat_payload,
+        http_request=request,
+        background_tasks=background_tasks,
+        user_id=user_id,
+    )
+
+    # Transcript is returned so the frontend can
+    # keep it hidden and reveal it only when the
+    # user presses "Transcribe".
+    return result.model_copy(
+        update={
+            "transcript": transcript,
+        }
+    )
 
 @app.post("/voice/transcribe", response_model=VoiceTranscriptionResponse)
 async def voice_transcribe(
@@ -6227,19 +6486,33 @@ async def voice_transcribe(
         window_seconds=600,
     )
 
-    # Voice transcription is an optional processing choice separate
-    # from general privacy-notice acknowledgement.
     require_voice_transcription_consent(user_id)
 
     audio_bytes, mime_type = await read_validated_audio(audio)
 
-    transcript = await transcribe_audio(
+    analysis = await transcribe_audio(
         audio_bytes,
         mime_type,
     )
 
+    voice_emotion = None
+
+    if analysis.primary_emotion:
+        voice_emotion = {
+            "primary":
+                analysis.primary_emotion,
+            "confidence":
+                analysis.emotion_confidence,
+            "intensity":
+                analysis.emotion_intensity,
+        }
+
     return {
-        "transcript": transcript
+        "transcript":
+            analysis.transcript.strip(),
+
+        "voice_emotion":
+            voice_emotion,
     }
 
 
