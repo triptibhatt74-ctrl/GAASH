@@ -2723,7 +2723,7 @@ def _cleanup_expired_backend_data_sync() -> dict:
             WHERE dismissed = TRUE
               AND created_at <
                   CURRENT_TIMESTAMP
-                  - (%s * INTERVAL '1 day')
+                  - make_interval(days => %s)
             """,
             (DATA_RETENTION_DAYS,),
         )
@@ -2736,14 +2736,13 @@ def _cleanup_expired_backend_data_sync() -> dict:
             WHERE status IN ('completed', 'cancelled')
               AND created_at <
                   CURRENT_TIMESTAMP
-                  - (%s * INTERVAL '1 day')
+                  - make_interval(days => %s)
             """,
             (DATA_RETENTION_DAYS,),
         )
         deleted["follow_ups"] = cur.rowcount
 
         conn.commit()
-
         return deleted
     
 async def cleanup_expired_backend_data() -> dict:
