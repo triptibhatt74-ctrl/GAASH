@@ -4240,8 +4240,7 @@ def _delete_conversation_sync(
             SELECT id
             FROM conversations
             WHERE user_id = %s
-              AND id = %s
-            LIMIT 1
+              AND coversation_id = %s
             """,
             (
                 user_id,
