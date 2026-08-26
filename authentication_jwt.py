@@ -17,6 +17,9 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Optional
+from __future__ import annotations
+from enum import StrEnum
+from collections.abc import Iterable
 
 import jwt
 from psycopg_pool import ConnectionPool
@@ -35,6 +38,8 @@ from privacy import (
     record_privacy_acknowledgement,
     record_voice_transcription_consent,
 )
+from schemas.auth import AuthenticatedPrincipal, PlatformRole
+from foundation.authorization import is_role_allowed
 
 load_dotenv()
 logger = logging.getLogger("gaash.auth")
@@ -206,6 +211,8 @@ def init_db() -> None:
                     email TEXT UNIQUE NOT NULL,
                     password TEXT NOT NULL,
                     is_verified BOOLEAN NOT NULL DEFAULT FALSE,
+                    role TEXT NOT NULL DEFAULT 'user'
+                        CHECK (role IN ('user', 'counsellor', 'authorized_official', 'admin')),
                     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -397,6 +404,7 @@ def as_utc_datetime(value: datetime | str) -> datetime:
     """Normalise Psycopg timestamps and string timestamps before comparison."""
     parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value)
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
 
 def create_auth_session(
     conn,
@@ -990,6 +998,56 @@ def get_current_user_id(
         )
     return user_id
 
+def get_current_principal(
+    user_id: int = Depends(get_current_user_id),
+) -> AuthenticatedPrincipal:
+    """Resolve role from the database; never trust a role claim from clients."""
+
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT role FROM users WHERE id=%s",
+            (user_id,),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid account session.",
+        )
+
+    try:
+        role = PlatformRole(row[0] or PlatformRole.USER)
+    except ValueError as exc:
+        logger.error("Invalid stored role for authenticated account")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account role is not permitted.",
+        ) from exc
+
+    return AuthenticatedPrincipal(
+        user_id=user_id,
+        role=role,
+    )
+
+
+def require_roles(*allowed_roles: PlatformRole):
+    """Dependency factory reserved for counsellor/official/admin routes."""
+
+    if not allowed_roles:
+        raise ValueError("At least one server-side role is required.")
+
+    def dependency(
+        principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    ) -> AuthenticatedPrincipal:
+        if not is_role_allowed(principal.role, allowed_roles):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This account role is not permitted.",
+            )
+
+        return principal
+
+    return dependency
 
 @dataclass(frozen=True)
 class ResetTokenContext:
@@ -1152,7 +1210,6 @@ class ResetTokenResponse(BaseModel):
 
 class CurrentUserResponse(SafeUserResponse):
     created_at: datetime
-
 
 # ============================================================
 # ROUTES

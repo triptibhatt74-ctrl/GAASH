@@ -25,6 +25,42 @@ from privacy import (
     get_privacy_acknowledgement,
     get_voice_transcription_consent,
 )
+from foundation.geography import require_state_ut
+from foundation.authorization import is_role_allowed
+from foundation.languages import language_registry_payload, registered_language_codes
+from foundation.memory import select_bounded_owned_memory
+from foundation.normalization import normalize_for_understanding
+from foundation.distress import compute_dynamic_distress_state
+from foundation.events import normalise_event_signals
+from foundation.external_cases import integration_status
+from foundation.operations import concise_reason_summary, normalize_priority, suppress_small_cell
+from foundation.voice import inspect_audio
+from schemas.cases import CaseContextResponse, CaseContextUpdate
+from schemas.auth import AuthenticatedPrincipal, PlatformRole
+from schemas.conversations import MemoryFact, MemoryRetrievalRequest, MemoryRetrievalResponse
+from schemas.languages import LanguageRegistryResponse
+from schemas.operations import (
+    AlertReviewRequest,
+    AlertReviewResponse,
+    AggregateLevel,
+    CaseAssignmentRequest,
+    CaseAssignmentResponse,
+    CaseDetailResponse,
+    CaseNoteCreate,
+    CaseNoteResponse,
+    CaseQueueResponse,
+    IntegrationAdapterStatus,
+    InterventionCreate,
+    InterventionResponse,
+    InterventionUpdate,
+    OperationalAggregateResponse,
+    OperationalCaseSummary,
+)
+from schemas.wellbeing import (
+    DynamicDistressStateResponse,
+    EngagementSummary as Phase2EngagementSummary,
+    VoiceAnalysisResponse as Phase2VoiceAnalysisResponse,
+)
 import jwt
 import uvicorn
 from dotenv import load_dotenv
@@ -114,6 +150,11 @@ CURRENT_SUMMARY_MAX_CHARS = int(
     )
 )
 MAX_AUDIO_BYTES = int(os.environ.get("MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))
+MAX_AUDIO_DURATION_SECONDS = float(os.environ.get("MAX_AUDIO_DURATION_SECONDS", "600"))
+VOICE_FFPROBE_PATH = os.environ.get("VOICE_FFPROBE_PATH", "").strip()
+# A deployment must configure a trusted duration inspector for non-WAV browser
+# containers before enabling them.  File size is not treated as duration.
+VOICE_REQUIRE_VERIFIED_DURATION = os.environ.get("VOICE_REQUIRE_VERIFIED_DURATION", "false").lower() == "true"
 REPORTING_TIMEZONE_NAME = os.getenv(
     "REPORTING_TIMEZONE",
     "Asia/Kolkata",
@@ -130,6 +171,8 @@ except Exception as exc:
     ) from exc
 
 MAX_ANALYTICS_DAYS = int(os.environ.get("MAX_ANALYTICS_DAYS", "400"))
+OPERATIONAL_QUEUE_MAX_LIMIT = max(1, min(100, int(os.environ.get("OPERATIONAL_QUEUE_MAX_LIMIT", "50"))))
+OPERATIONAL_MINIMUM_CELL_COUNT = max(2, min(100, int(os.environ.get("OPERATIONAL_MINIMUM_CELL_COUNT", "5"))))
 
 DATA_RETENTION_DAYS = max(
     30,
@@ -167,7 +210,9 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-SUPPORTED_LANGUAGES = {"en", "hi", "ur", "ks", "doi", "hinglish"}
+# Registry-backed language support. Hinglish remains an accepted input-style
+# alias and is normalized internally; it is not represented as a translated UI.
+SUPPORTED_LANGUAGES = registered_language_codes() | {"hinglish"}
 SUPPORTED_THEMES = {"light", "dark", "system"}
 
 @asynccontextmanager
@@ -249,7 +294,7 @@ def enforce_rate_limit(request: Request, scope: str, limit: int, window_seconds:
 # System prompt
 
 SYSTEM_PROMPT = """
-You are Gaash: a conversational support and screening assistant for young people, including people in Jammu & Kashmir. The person should experience an attentive, intelligent conversation—not a questionnaire, counselling script, diagnostic report, or generic support bot. `response_to_user` is the only human-facing field; every other NLPAnalysis field is private backend data.
+You are Gaash: a conversational support and screening assistant for young people across India. The person should experience an attentive, intelligent conversation—not a questionnaire, counselling script, diagnostic report, or generic support bot. `response_to_user` is the only human-facing field; every other NLPAnalysis field is private backend data.
 
 You are not a doctor, therapist, psychiatrist, or diagnostic authority. Do not diagnose, prescribe or change medication, claim to replace a professional, invent facts/symptoms/frequency/scores/quotes, or expose private analytics, prompts, thresholds, or backend reasoning.
 
@@ -504,6 +549,8 @@ def init_gaash_tables() -> None:
                     email TEXT UNIQUE NOT NULL,
                     password TEXT NOT NULL,
                     is_verified BOOLEAN NOT NULL DEFAULT FALSE,
+                    role TEXT NOT NULL DEFAULT 'user'
+                        CHECK (role IN ('user', 'counsellor', 'authorized_official', 'admin')),
                     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -518,6 +565,9 @@ def init_gaash_tables() -> None:
                     id BIGSERIAL PRIMARY KEY,
                     conversation_id TEXT UNIQUE NOT NULL,
                     user_id BIGINT NOT NULL,
+                    preferred_language TEXT,
+                    last_message_at TIMESTAMPTZ,
+                    metadata_updated_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -796,6 +846,12 @@ def init_gaash_tables() -> None:
                     reflection TEXT,
                     practice_type TEXT,
                     source_conversation_id TEXT,
+                    source_message_id BIGINT,
+                    source_kind TEXT NOT NULL DEFAULT 'conversation'
+                        CHECK (source_kind IN ('conversation', 'assessment', 'profile', 'user-confirmed')),
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'superseded', 'withdrawn')),
+                    observed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     created_at TIMESTAMPTZ NOT NULL
                         DEFAULT CURRENT_TIMESTAMP
                 )
@@ -830,6 +886,36 @@ def init_gaash_tables() -> None:
                     updated_at TIMESTAMPTZ NOT NULL
                         DEFAULT CURRENT_TIMESTAMP
                 )
+                """
+            )
+
+            # Case context is intentionally limited to monitoring metadata.
+            # It contains no FIR, police, or unnecessary incident narrative.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS case_contexts (
+                    id TEXT PRIMARY KEY,
+                    public_case_reference TEXT NOT NULL UNIQUE,
+                    user_id BIGINT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                    external_reference_id TEXT,
+                    state_ut TEXT NOT NULL CHECK (state_ut ~ '^IN-[A-Z]{2}$'),
+                    district TEXT,
+                    case_stage TEXT,
+                    monitoring_status TEXT NOT NULL DEFAULT 'not_enrolled'
+                        CHECK (monitoring_status IN ('not_enrolled', 'active', 'paused', 'closed')),
+                    preferred_language TEXT,
+                    consent_status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (consent_status IN ('pending', 'granted', 'withdrawn')),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_case_contexts_state_district
+                ON case_contexts (state_ut, district)
                 """
             )
             
@@ -929,8 +1015,14 @@ def init_gaash_tables() -> None:
                     name TEXT NOT NULL,
                     district TEXT,
                     resource_type TEXT,
+                    category TEXT,
+                    state_ut TEXT,
+                    city TEXT,
+                    description TEXT,
                     services TEXT,
                     availability TEXT,
+                    access_mode TEXT,
+                    eligibility TEXT,
                     emergency BOOLEAN NOT NULL DEFAULT FALSE,
                     contact_phone TEXT,
                     contact_email TEXT,
@@ -941,6 +1033,9 @@ def init_gaash_tables() -> None:
                     verified_source TEXT,
                     source_url TEXT,
                     verification_date TEXT,
+                    last_verified DATE,
+                    latitude DOUBLE PRECISION,
+                    longitude DOUBLE PRECISION,
                     search_text TEXT
                 )
                 """
@@ -1424,6 +1519,7 @@ class RiskResponse(BaseModel):
 
 class ChatResponse(BaseModel):
     message_id: str
+    user_message_id: Optional[str] = None
     reply: str
     conversation_id: str
     emotion: Optional[EmotionResponse] = None
@@ -1438,6 +1534,8 @@ class ChatResponse(BaseModel):
     escalation_created: bool = False
     crisis_pathway: Optional[CrisisPathway] = None
     report: Optional[ChatReport] = None
+    distress_state: Optional[DynamicDistressStateResponse] = None
+    voice_analysis: Optional[Phase2VoiceAnalysisResponse] = None
 
 class AssessmentAnswerRequest(BaseModel):
     item_id: int = Field(..., ge=1)
@@ -1610,6 +1708,9 @@ class AnalyticsResponse(BaseModel):
     check_ins: List[Dict[str, Any]]
     period_start: str
     period_end: str
+    dynamic_distress: Optional[DynamicDistressStateResponse] = None
+    engagement: Optional[Phase2EngagementSummary] = None
+    voice_indicators: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ReportResponse(BaseModel):
@@ -1624,6 +1725,9 @@ class ReportResponse(BaseModel):
     recommendations: List[Dict[str, Any]]
     risk: RiskResponse
     safety_status: str
+    dynamic_distress: Optional[DynamicDistressStateResponse] = None
+    engagement: Optional[Phase2EngagementSummary] = None
+    voice_indicators: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class WeeklySummaryRouteResponse(BaseModel):
@@ -1707,6 +1811,108 @@ def _health_db_sync() -> bool:
     with get_conn() as conn:
         row = conn.execute("SELECT 1 AS ok").fetchone()
         return bool(row and row["ok"] == 1)
+
+
+def _log_safe_timing(operation: str, started_at: float) -> None:
+    """Emit aggregate timing only—never message text, identifiers, or payloads."""
+
+    logger.info("operation=%s duration_ms=%d", operation, round((time.perf_counter() - started_at) * 1000))
+
+
+def _get_case_context_sync(user_id: int) -> Optional[DatabaseRow]:
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT id, public_case_reference, state_ut, district,
+                   monitoring_status, preferred_language, consent_status,
+                   created_at, updated_at
+            FROM case_contexts
+            WHERE user_id=%s
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+
+
+def _upsert_case_context_sync(user_id: int, data: CaseContextUpdate) -> DatabaseRow:
+    case_id = f"case_{uuid.uuid4().hex}"
+    public_reference = f"GAASH-CASE-{uuid.uuid4().hex[:12].upper()}"
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO case_contexts (
+                id, public_case_reference, user_id, state_ut, district,
+                preferred_language
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE
+            SET state_ut=EXCLUDED.state_ut,
+                district=EXCLUDED.district,
+                preferred_language=EXCLUDED.preferred_language,
+                updated_at=CURRENT_TIMESTAMP
+            RETURNING id, public_case_reference, state_ut, district,
+                      monitoring_status, preferred_language, consent_status,
+                      created_at, updated_at
+            """,
+            (
+                case_id,
+                public_reference,
+                user_id,
+                data.state_ut,
+                data.district,
+                data.preferred_language,
+            ),
+        ).fetchone()
+        conn.commit()
+        return row
+
+
+def _phase1_memory_retrieval_rows_sync(
+    user_id: int,
+    current_conversation_id: Optional[str],
+) -> tuple[list[DatabaseRow], list[DatabaseRow]]:
+    """Fetch only the authenticated owner's durable records, bounded in SQL."""
+
+    with get_conn() as conn:
+        memory_rows = conn.execute(
+            """
+            SELECT user_id, memory_key, memory_value, memory_type,
+                   source_conversation_id, source_message_id, source_kind,
+                   confidence, status, observed_at, updated_at
+            FROM user_memories
+            WHERE user_id=%s AND status='active'
+            ORDER BY updated_at DESC
+            LIMIT 36
+            """,
+            (user_id,),
+        ).fetchall()
+        if current_conversation_id:
+            summary_rows = conn.execute(
+                """
+                SELECT cs.user_id, cs.conversation_id, cs.summary_text, cs.updated_at
+                FROM conversation_summaries AS cs
+                JOIN conversations AS c ON c.conversation_id=cs.conversation_id
+                WHERE c.user_id=%s AND cs.user_id=%s
+                  AND cs.conversation_id <> %s
+                  AND TRIM(cs.summary_text) <> ''
+                ORDER BY cs.updated_at DESC
+                LIMIT 24
+                """,
+                (user_id, user_id, current_conversation_id),
+            ).fetchall()
+        else:
+            summary_rows = conn.execute(
+                """
+                SELECT cs.user_id, cs.conversation_id, cs.summary_text, cs.updated_at
+                FROM conversation_summaries AS cs
+                JOIN conversations AS c ON c.conversation_id=cs.conversation_id
+                WHERE c.user_id=%s AND cs.user_id=%s
+                  AND TRIM(cs.summary_text) <> ''
+                ORDER BY cs.updated_at DESC
+                LIMIT 24
+                """,
+                (user_id, user_id),
+            ).fetchall()
+    return list(memory_rows), list(summary_rows)
 
 def _get_profile_sync(user_id: int) -> Optional[DatabaseRow]:
     with get_conn() as conn:
@@ -1861,6 +2067,37 @@ def get_current_user_id(
         )
 
     return user_id
+
+
+def get_current_principal(
+    user_id: int = Depends(get_current_user_id),
+) -> AuthenticatedPrincipal:
+    """Resolve the role from server data for future protected staff routes."""
+
+    with get_conn() as conn:
+        row = conn.execute("SELECT role FROM users WHERE id=%s", (user_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=401, detail="Invalid account session.")
+    try:
+        return AuthenticatedPrincipal(user_id=user_id, role=PlatformRole(row["role"] or "user"))
+    except ValueError as exc:
+        logger.error("Invalid stored role for authenticated account")
+        raise HTTPException(status_code=403, detail="Account role is not permitted.") from exc
+
+
+def require_roles(*allowed_roles: PlatformRole):
+    """Dependency factory reserved for server-authorized Phase 3 views."""
+
+    if not allowed_roles:
+        raise ValueError("At least one server-side role is required.")
+
+    def dependency(principal: AuthenticatedPrincipal = Depends(get_current_principal)) -> AuthenticatedPrincipal:
+        if not is_role_allowed(principal.role, allowed_roles):
+            raise HTTPException(status_code=403, detail="This account role is not permitted.")
+        return principal
+
+    return dependency
+
 
 def require_voice_transcription_consent(user_id: int) -> None:
     try:
@@ -2524,6 +2761,16 @@ def _save_message_sync(user_id, role, content, conversation_id=None) -> int:
             (user_id, role, content, conversation_id),
         )
         message_id = cur.fetchone()["id"]
+        if conversation_id:
+            conn.execute(
+                """
+                UPDATE conversations
+                SET last_message_at=CURRENT_TIMESTAMP,
+                    metadata_updated_at=CURRENT_TIMESTAMP
+                WHERE user_id=%s AND conversation_id=%s
+                """,
+                (user_id, conversation_id),
+            )
         conn.commit()
         return int(message_id)
 
@@ -2541,6 +2788,720 @@ async def save_message(
         content,
         conversation_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: bounded longitudinal wellbeing event and decision-support state
+# ---------------------------------------------------------------------------
+
+def _case_id_for_user_sync(user_id: int) -> Optional[str]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM case_contexts WHERE user_id=%s LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return str(row["id"]) if row else None
+
+
+async def get_case_id_for_user(user_id: int) -> Optional[str]:
+    return await run_db(_case_id_for_user_sync, user_id)
+
+
+def _create_wellbeing_event_sync(
+    user_id: int,
+    case_id: Optional[str],
+    source_type: str,
+    structured_signals: Dict[str, Any],
+    confidence: Optional[float],
+    source_reference: Optional[str],
+    conversation_id: Optional[str],
+    assessment_id: Optional[str],
+) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO wellbeing_events (
+                user_id, case_id, source_type, structured_signals, confidence,
+                source_reference, conversation_id, assessment_id
+            ) VALUES (%s,%s,%s,%s::jsonb,%s,%s,%s,%s)
+            RETURNING id
+            """,
+            (
+                user_id,
+                case_id,
+                source_type,
+                json.dumps(structured_signals),
+                confidence,
+                source_reference,
+                conversation_id,
+                assessment_id,
+            ),
+        ).fetchone()
+        conn.commit()
+        return int(row["id"])
+
+
+async def create_wellbeing_event(
+    *,
+    user_id: int,
+    source_type: str,
+    raw_signals: Dict[str, Any],
+    source_reference: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    assessment_id: Optional[str] = None,
+) -> int:
+    """Persist only compact structured evidence; never raw messages/audio."""
+
+    case_id = await get_case_id_for_user(user_id)
+    signals = normalise_event_signals(source_type, raw_signals)
+    confidence = signals.get("emotion_confidence")
+    return await run_db(
+        _create_wellbeing_event_sync,
+        user_id,
+        case_id,
+        source_type,
+        signals,
+        confidence if isinstance(confidence, (float, int)) else None,
+        source_reference,
+        conversation_id,
+        assessment_id,
+    )
+
+
+def _recent_wellbeing_events_sync(user_id: int, limit: int = 40) -> List[DatabaseRow]:
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT id, user_id, case_id, timestamp, source_type, structured_signals,
+                   confidence, source_reference, conversation_id, assessment_id
+            FROM wellbeing_events
+            WHERE user_id=%s
+            ORDER BY timestamp DESC, id DESC
+            LIMIT %s
+            """,
+            (user_id, min(max(limit, 1), 80)),
+        ).fetchall()
+
+
+def _recent_dynamic_states_sync(user_id: int, limit: int = 2) -> List[DatabaseRow]:
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT state, trajectory, confidence, contributing_indicators,
+                   requires_human_review, computed_at
+            FROM dynamic_distress_states
+            WHERE user_id=%s
+            ORDER BY computed_at DESC, id DESC
+            LIMIT %s
+            """,
+            (user_id, min(max(limit, 1), 8)),
+        ).fetchall()
+
+
+def _engagement_summary_sync(user_id: int, days: int = 28) -> Dict[str, Any]:
+    with get_conn() as conn:
+        conversation_count = conn.execute(
+            """SELECT COUNT(DISTINCT conversation_id) AS count
+               FROM conversation_messages
+               WHERE user_id=%s AND timestamp >= CURRENT_TIMESTAMP - (%s * INTERVAL '1 day')""",
+            (user_id, days),
+        ).fetchone()["count"]
+        assessment_count = conn.execute(
+            """SELECT COUNT(*) AS count FROM screening_measurements
+               WHERE user_id=%s AND completed_at >= CURRENT_TIMESTAMP - (%s * INTERVAL '1 day')""",
+            (user_id, days),
+        ).fetchone()["count"]
+        schedule = conn.execute(
+            """SELECT next_check_in_due FROM monitoring_schedules
+               WHERE user_id=%s LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+        missed = bool(schedule and schedule["next_check_in_due"] and schedule["next_check_in_due"] < datetime.now(timezone.utc))
+        return {
+            "conversation_count": int(conversation_count or 0),
+            "assessment_completion_count": int(assessment_count or 0),
+            "missed_check_in": missed,
+            "change": "unknown",
+            "note": "Engagement is contextual only and does not establish a safety conclusion.",
+        }
+
+
+def _store_dynamic_distress_state_sync(
+    user_id: int,
+    case_id: Optional[str],
+    event_id: Optional[int],
+    state: Dict[str, Any],
+) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO dynamic_distress_states (
+                user_id, case_id, event_id, state, trajectory, confidence,
+                contributing_indicators, requires_human_review, computed_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s)
+            RETURNING id
+            """,
+            (
+                user_id,
+                case_id,
+                event_id,
+                state["state"],
+                state["trajectory"],
+                state["confidence"],
+                json.dumps(state["contributing_indicators"]),
+                state["requires_human_review"],
+                state["computed_at"],
+            ),
+        ).fetchone()
+        conn.commit()
+        return int(row["id"])
+
+
+def _create_monitoring_alert_if_needed_sync(
+    user_id: int,
+    case_id: Optional[str],
+    distress_state_id: int,
+    state: Dict[str, Any],
+) -> None:
+    if state["state"] not in {"elevated", "high", "critical"}:
+        return
+    with get_conn() as conn:
+        existing = conn.execute(
+            """SELECT id FROM monitoring_alerts
+               WHERE user_id=%s AND status='open' AND state=%s
+                 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+               LIMIT 1""",
+            (user_id, state["state"]),
+        ).fetchone()
+        if existing is None:
+            labels = [str(item.get("label") or "") for item in state["contributing_indicators"]]
+            reason = "; ".join(label for label in labels if label)[:500] or "Longitudinal wellbeing indicators require human review."
+            conn.execute(
+                """INSERT INTO monitoring_alerts (
+                    user_id, case_id, distress_state_id, state, reason, requires_human_review
+                ) VALUES (%s,%s,%s,%s,%s,TRUE)""",
+                (user_id, case_id, distress_state_id, state["state"], reason),
+            )
+            conn.commit()
+
+
+def _ensure_monitoring_schedule_sync(user_id: int, case_id: Optional[str]) -> None:
+    """Prepare a check-in schedule only for an opted-in active case.
+
+    This writes scheduling state; it deliberately does not deliver email, SMS,
+    push notifications, or any other reminder by itself.
+    """
+
+    if not case_id:
+        return
+    with get_conn() as conn:
+        context = conn.execute(
+            """SELECT monitoring_status, consent_status
+               FROM case_contexts WHERE id=%s AND user_id=%s LIMIT 1""",
+            (case_id, user_id),
+        ).fetchone()
+        if not context or context["monitoring_status"] != "active" or context["consent_status"] != "granted":
+            return
+        conn.execute(
+            """INSERT INTO monitoring_schedules (
+                   user_id, case_id, next_check_in_due, last_evaluated_at
+               ) VALUES (%s,%s,CURRENT_TIMESTAMP + INTERVAL '14 days',CURRENT_TIMESTAMP)
+               ON CONFLICT (user_id) DO UPDATE
+               SET case_id=EXCLUDED.case_id,
+                   last_evaluated_at=CURRENT_TIMESTAMP,
+                   missed_check_in=(monitoring_schedules.next_check_in_due IS NOT NULL
+                     AND monitoring_schedules.next_check_in_due < CURRENT_TIMESTAMP),
+                   updated_at=CURRENT_TIMESTAMP""",
+            (user_id, case_id),
+        )
+        conn.commit()
+
+
+async def compute_and_store_dynamic_distress_state(user_id: int, event_id: Optional[int] = None) -> DynamicDistressStateResponse:
+    """Calculate explainable state for the authenticated owner only.
+
+    Alerts create review records only. They do not send notifications or
+    trigger automated external intervention.
+    """
+
+    started_at = time.perf_counter()
+    try:
+        events, trends, engagement, previous_states, case_id = await asyncio.gather(
+            run_db(_recent_wellbeing_events_sync, user_id),
+            compute_four_week_trends(user_id),
+            run_db(_engagement_summary_sync, user_id),
+            run_db(_recent_dynamic_states_sync, user_id),
+            get_case_id_for_user(user_id),
+        )
+        state = compute_dynamic_distress_state(
+            events=events,
+            assessment_trends=trends,
+            engagement=engagement,
+            previous_states=previous_states,
+        )
+        stored_id = await run_db(_store_dynamic_distress_state_sync, user_id, case_id, event_id, state)
+        await run_db(_create_monitoring_alert_if_needed_sync, user_id, case_id, stored_id, state)
+        await run_db(_ensure_monitoring_schedule_sync, user_id, case_id)
+        return DynamicDistressStateResponse(**state)
+    finally:
+        _log_safe_timing("distress_computation", started_at)
+
+
+async def get_latest_dynamic_distress_state(user_id: int) -> Optional[DynamicDistressStateResponse]:
+    rows = await run_db(_recent_dynamic_states_sync, user_id, 1)
+    if not rows:
+        return None
+    row = dict(rows[0])
+    indicators = row.get("contributing_indicators")
+    if isinstance(indicators, str):
+        try:
+            indicators = json.loads(indicators)
+        except json.JSONDecodeError:
+            indicators = []
+    return DynamicDistressStateResponse(
+        state=row["state"], trajectory=row["trajectory"], confidence=row["confidence"],
+        contributing_indicators=indicators or [], requires_human_review=bool(row.get("requires_human_review")),
+        computed_at=row["computed_at"],
+    )
+
+
+async def get_longitudinal_monitoring_payload(user_id: int) -> Dict[str, Any]:
+    """Return owned, compact monitoring data for report/analytics endpoints."""
+
+    state, engagement, events = await asyncio.gather(
+        get_latest_dynamic_distress_state(user_id),
+        run_db(_engagement_summary_sync, user_id),
+        run_db(_recent_wellbeing_events_sync, user_id, 12),
+    )
+    voice_indicators: List[Dict[str, Any]] = []
+    for event in events:
+        signals = event.get("structured_signals")
+        if isinstance(signals, str):
+            try:
+                signals = json.loads(signals)
+            except json.JSONDecodeError:
+                signals = {}
+        if str(event.get("source_type")) != "voice" or not isinstance(signals, dict):
+            continue
+        primary = signals.get("primary_emotion")
+        if isinstance(primary, str) and primary.strip():
+            voice_indicators.append({
+                "timestamp": event.get("timestamp"),
+                "primary_emotion": primary.strip(),
+                "confidence": signals.get("emotion_confidence"),
+                "acoustic_available": bool(signals.get("acoustic_available")),
+            })
+    return {
+        "dynamic_distress": state.model_dump(mode="json") if state else None,
+        "engagement": Phase2EngagementSummary(**engagement).model_dump(mode="json"),
+        "voice_indicators": voice_indicators[:6],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: authorized support operations
+# ---------------------------------------------------------------------------
+
+_STAFF_ROLES = {PlatformRole.COUNSELLOR, PlatformRole.AUTHORIZED_OFFICIAL, PlatformRole.ADMIN}
+_CASE_PERMISSION_LEVEL = {"case_summary": 1, "intervention_update": 2, "case_manage": 3}
+
+
+def _decode_json_array(value: object) -> List[Dict[str, Any]]:
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, dict)]
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return [dict(item) for item in decoded if isinstance(item, dict)] if isinstance(decoded, list) else []
+    return []
+
+
+def _assert_staff(principal: AuthenticatedPrincipal) -> None:
+    if principal.role not in _STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="This account role is not permitted.")
+
+
+def _required_permission_names(permission: str) -> tuple[str, ...]:
+    minimum = _CASE_PERMISSION_LEVEL[permission]
+    return tuple(name for name, level in _CASE_PERMISSION_LEVEL.items() if level >= minimum)
+
+
+def _has_case_access_sync(principal: AuthenticatedPrincipal, case_id: str, permission: str = "case_summary") -> bool:
+    """Check explicit staff authorization without opening private history.
+
+    A case assignment gives a counsellor summary/intervention access only. All
+    other access, including every administrator's case access, must come from
+    an active case-level grant. Geography grants never satisfy this check.
+    """
+
+    if principal.role not in _STAFF_ROLES or permission not in _CASE_PERMISSION_LEVEL:
+        return False
+    with get_conn() as conn:
+        if principal.role == PlatformRole.COUNSELLOR and permission in {"case_summary", "intervention_update"}:
+            assignment = conn.execute(
+                """SELECT 1 FROM case_assignments
+                   WHERE case_id=%s AND assigned_to_user_id=%s AND status='active'
+                   LIMIT 1""",
+                (case_id, principal.user_id),
+            ).fetchone()
+            if assignment is not None:
+                return True
+        row = conn.execute(
+            """SELECT 1 FROM case_authorizations
+               WHERE case_id=%s AND staff_user_id=%s AND revoked_at IS NULL
+                 AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+                 AND permission = ANY(%s)
+               LIMIT 1""",
+            (case_id, principal.user_id, list(_required_permission_names(permission))),
+        ).fetchone()
+    return row is not None
+
+
+async def require_case_access(principal: AuthenticatedPrincipal, case_id: str, permission: str = "case_summary") -> None:
+    _assert_staff(principal)
+    allowed = await run_db(_has_case_access_sync, principal, case_id, permission)
+    if not allowed:
+        # A uniform not-found response avoids confirming unrelated case IDs.
+        raise HTTPException(status_code=404, detail="Case not available.")
+
+
+def _case_queue_rows_sync(principal: AuthenticatedPrincipal, limit: int, offset: int = 0) -> List[DatabaseRow]:
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT
+                c.id AS case_id,
+                c.public_case_reference,
+                c.state_ut,
+                c.district,
+                COALESCE(state_row.state, 'unknown') AS priority,
+                COALESCE(state_row.trajectory, 'unknown') AS trajectory,
+                state_row.computed_at AS last_evaluated_at,
+                COALESCE(alert_row.reason, 'Human review is pending for this case.') AS reason_summary,
+                alert_row.id AS alert_id,
+                review_row.reviewed_at AS last_reviewed_at,
+                CASE WHEN assignment_row.assigned_to_user_id IS NULL THEN NULL ELSE 'Assigned support professional' END AS assigned_professional,
+                CASE
+                    WHEN alert_row.id IS NOT NULL THEN 'Review alert'
+                    WHEN intervention_row.id IS NOT NULL THEN 'Update intervention'
+                    ELSE NULL
+                END AS pending_action
+            FROM case_contexts c
+            LEFT JOIN LATERAL (
+                SELECT state, trajectory, computed_at
+                FROM dynamic_distress_states
+                WHERE case_id=c.id
+                ORDER BY computed_at DESC, id DESC LIMIT 1
+            ) state_row ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT id, reason
+                FROM monitoring_alerts
+                WHERE case_id=c.id AND status='open' AND requires_human_review
+                ORDER BY created_at DESC, id DESC LIMIT 1
+            ) alert_row ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT reviewed_at FROM alert_reviews
+                WHERE case_id=c.id ORDER BY reviewed_at DESC, id DESC LIMIT 1
+            ) review_row ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT assigned_to_user_id FROM case_assignments
+                WHERE case_id=c.id AND status='active' ORDER BY updated_at DESC, id DESC LIMIT 1
+            ) assignment_row ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT id FROM intervention_records
+                WHERE case_id=c.id AND status IN ('planned', 'in_progress')
+                ORDER BY updated_at DESC, id DESC LIMIT 1
+            ) intervention_row ON TRUE
+            WHERE c.monitoring_status='active'
+              AND (
+                EXISTS (
+                    SELECT 1 FROM case_authorizations ca
+                    WHERE ca.case_id=c.id AND ca.staff_user_id=%s AND ca.revoked_at IS NULL
+                      AND (ca.expires_at IS NULL OR ca.expires_at > CURRENT_TIMESTAMP)
+                )
+                OR (
+                    %s = 'counsellor' AND EXISTS (
+                        SELECT 1 FROM case_assignments own_assignment
+                        WHERE own_assignment.case_id=c.id AND own_assignment.assigned_to_user_id=%s
+                          AND own_assignment.status='active'
+                    )
+                )
+              )
+            ORDER BY
+                CASE COALESCE(state_row.state, 'unknown')
+                    WHEN 'critical' THEN 5 WHEN 'high' THEN 4 WHEN 'elevated' THEN 3
+                    WHEN 'watch' THEN 2 WHEN 'stable' THEN 1 ELSE 0 END DESC,
+                state_row.computed_at DESC NULLS LAST,
+                c.id DESC
+            LIMIT %s OFFSET %s
+            """,
+            (principal.user_id, principal.role.value, principal.user_id, limit, offset),
+        ).fetchall()
+
+
+def _case_detail_row_sync(case_id: str) -> Optional[DatabaseRow]:
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT c.id AS case_id, c.public_case_reference, c.state_ut, c.district,
+                   COALESCE(state_row.state, 'unknown') AS priority,
+                   COALESCE(state_row.trajectory, 'unknown') AS trajectory,
+                   state_row.confidence, state_row.contributing_indicators,
+                   state_row.computed_at AS last_evaluated_at,
+                   COALESCE(alert_row.reason, 'No pending human review task.') AS reason_summary,
+                   alert_row.id AS alert_id,
+                   review_row.reviewed_at AS last_reviewed_at,
+                   CASE WHEN assignment_row.assigned_to_user_id IS NULL THEN NULL ELSE 'Assigned support professional' END AS assigned_professional,
+                   CASE WHEN alert_row.id IS NOT NULL THEN 'Review alert' ELSE NULL END AS pending_action,
+                   period_row.data_period_start, period_row.data_period_end
+            FROM case_contexts c
+            LEFT JOIN LATERAL (
+                SELECT state, trajectory, confidence, contributing_indicators, computed_at
+                FROM dynamic_distress_states WHERE case_id=c.id
+                ORDER BY computed_at DESC, id DESC LIMIT 1
+            ) state_row ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT reason FROM monitoring_alerts
+                WHERE case_id=c.id AND status='open' AND requires_human_review
+                ORDER BY created_at DESC, id DESC LIMIT 1
+            ) alert_row ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT reviewed_at FROM alert_reviews WHERE case_id=c.id
+                ORDER BY reviewed_at DESC, id DESC LIMIT 1
+            ) review_row ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT assigned_to_user_id FROM case_assignments WHERE case_id=c.id AND status='active'
+                ORDER BY updated_at DESC, id DESC LIMIT 1
+            ) assignment_row ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT MIN(timestamp) AS data_period_start, MAX(timestamp) AS data_period_end
+                FROM wellbeing_events WHERE case_id=c.id
+            ) period_row ON TRUE
+            WHERE c.id=%s
+            """,
+            (case_id,),
+        ).fetchone()
+
+
+def _case_assessments_sync(case_id: str) -> List[DatabaseRow]:
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT DISTINCT ON (m.assessment_type) m.assessment_type, m.total, m.completed_at
+            FROM screening_measurements m
+            JOIN case_contexts c ON c.user_id=m.user_id
+            WHERE c.id=%s
+            ORDER BY m.assessment_type, m.completed_at DESC NULLS LAST, m.id DESC
+            """,
+            (case_id,),
+        ).fetchall()
+
+
+def _safe_audit_sync(
+    actor_user_id: int,
+    action: str,
+    *,
+    case_id: Optional[str] = None,
+    resource_type: str,
+    resource_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Append an audit event with a digest, never including note/chat content."""
+
+    safe_metadata = {str(key)[:80]: str(value)[:120] for key, value in (metadata or {}).items()}
+    event_id = uuid.uuid4()
+    occurred_at = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        previous = conn.execute("SELECT event_digest FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
+        previous_digest = previous["event_digest"] if previous else ""
+        digest_source = json.dumps(
+            {
+                "event_id": str(event_id), "occurred_at": occurred_at.isoformat(), "actor": actor_user_id,
+                "action": action, "case": case_id, "resource_type": resource_type,
+                "resource_id": resource_id, "metadata": safe_metadata, "previous": previous_digest,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        event_digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+        conn.execute(
+            """INSERT INTO audit_events (
+                   event_id, occurred_at, actor_user_id, action, case_id, resource_type,
+                   resource_id, metadata, previous_digest, event_digest
+               ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (str(event_id), occurred_at, actor_user_id, action, case_id, resource_type,
+             resource_id, json.dumps(safe_metadata), previous_digest or None, event_digest),
+        )
+        conn.commit()
+
+
+async def write_safe_audit(*args: Any, **kwargs: Any) -> None:
+    await run_db(_safe_audit_sync, *args, **kwargs)
+
+
+def _is_staff_user_sync(user_id: int) -> bool:
+    with get_conn() as conn:
+        row = conn.execute("SELECT role FROM users WHERE id=%s", (user_id,)).fetchone()
+    return row is not None and str(row["role"] or "user") in {role.value for role in _STAFF_ROLES}
+
+
+def _assign_case_sync(case_id: str, actor_user_id: int, assigned_to_user_id: int) -> DatabaseRow:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE case_assignments SET status='reassigned', updated_at=CURRENT_TIMESTAMP WHERE case_id=%s AND status='active'",
+            (case_id,),
+        )
+        row = conn.execute(
+            """INSERT INTO case_assignments (case_id, assigned_to_user_id, assigned_by)
+               VALUES (%s,%s,%s)
+               RETURNING case_id, assigned_to_user_id, status, updated_at""",
+            (case_id, assigned_to_user_id, actor_user_id),
+        ).fetchone()
+        conn.commit()
+        return row
+
+
+def _alert_case_id_sync(alert_id: int) -> Optional[str]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT case_id FROM monitoring_alerts WHERE id=%s", (alert_id,)).fetchone()
+    return str(row["case_id"]) if row and row.get("case_id") else None
+
+
+def _review_alert_sync(alert_id: int, case_id: str, reviewer_user_id: int, decision: str, note: Optional[str]) -> DatabaseRow:
+    with get_conn() as conn:
+        review = conn.execute(
+            """INSERT INTO alert_reviews (alert_id, case_id, reviewer_user_id, decision, note)
+               VALUES (%s,%s,%s,%s,%s)
+               RETURNING id, alert_id, decision, reviewed_at""",
+            (alert_id, case_id, reviewer_user_id, decision, note),
+        ).fetchone()
+        next_status = "closed" if decision in {"not_concerning", "false_positive"} else "acknowledged"
+        conn.execute(
+            "UPDATE monitoring_alerts SET status=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s",
+            (next_status, alert_id),
+        )
+        conn.commit()
+        return review
+
+
+def _list_interventions_sync(case_id: str) -> List[DatabaseRow]:
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT id, case_id, intervention_type, status, created_by, assigned_to,
+                      created_at, updated_at, notes, outcome
+               FROM intervention_records WHERE case_id=%s ORDER BY updated_at DESC, id DESC""",
+            (case_id,),
+        ).fetchall()
+
+
+def _create_intervention_sync(case_id: str, actor_user_id: int, data: InterventionCreate) -> DatabaseRow:
+    with get_conn() as conn:
+        row = conn.execute(
+            """INSERT INTO intervention_records (case_id, intervention_type, created_by, assigned_to, notes)
+               VALUES (%s,%s,%s,%s,%s)
+               RETURNING id, case_id, intervention_type, status, created_by, assigned_to, created_at, updated_at, notes, outcome""",
+            (case_id, data.intervention_type.value, actor_user_id, data.assigned_to_user_id, data.notes),
+        ).fetchone()
+        conn.commit()
+        return row
+
+
+def _update_intervention_sync(case_id: str, intervention_id: int, data: InterventionUpdate) -> Optional[DatabaseRow]:
+    fields: List[str] = []
+    values: List[Any] = []
+    if data.status is not None:
+        fields.append("status=%s")
+        values.append(data.status.value)
+    if data.assigned_to_user_id is not None:
+        fields.append("assigned_to=%s")
+        values.append(data.assigned_to_user_id)
+    if data.notes is not None:
+        fields.append("notes=%s")
+        values.append(data.notes)
+    if data.outcome is not None:
+        fields.append("outcome=%s")
+        values.append(data.outcome)
+    if not fields:
+        return None
+    with get_conn() as conn:
+        row = conn.execute(
+            f"""UPDATE intervention_records SET {', '.join(fields)}, updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s AND case_id=%s
+                RETURNING id, case_id, intervention_type, status, created_by, assigned_to, created_at, updated_at, notes, outcome""",
+            [*values, intervention_id, case_id],
+        ).fetchone()
+        conn.commit()
+        return row
+
+
+def _list_case_notes_sync(case_id: str) -> List[DatabaseRow]:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT id, created_at, created_by, note FROM case_notes WHERE case_id=%s ORDER BY created_at DESC, id DESC LIMIT 100",
+            (case_id,),
+        ).fetchall()
+
+
+def _create_case_note_sync(case_id: str, actor_user_id: int, note: str) -> DatabaseRow:
+    with get_conn() as conn:
+        row = conn.execute(
+            """INSERT INTO case_notes (case_id, created_by, note) VALUES (%s,%s,%s)
+               RETURNING id, created_at, created_by, note""",
+            (case_id, actor_user_id, note),
+        ).fetchone()
+        conn.commit()
+        return row
+
+
+def _aggregate_scope_sync(principal: AuthenticatedPrincipal, level: str, state_ut: Optional[str], district: Optional[str]) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM official_geography_scopes
+               WHERE user_id=%s AND revoked_at IS NULL
+                 AND scope_level=%s
+                 AND (state_ut IS NOT DISTINCT FROM %s)
+                 AND (district IS NOT DISTINCT FROM %s)
+               LIMIT 1""",
+            (principal.user_id, level, state_ut, district),
+        ).fetchone()
+    return row is not None
+
+
+def _operational_aggregate_counts_sync(state_ut: Optional[str], district: Optional[str]) -> Dict[str, int]:
+    filters = ["c.monitoring_status='active'"]
+    values: List[Any] = []
+    if state_ut:
+        filters.append("c.state_ut=%s")
+        values.append(state_ut)
+    if district:
+        filters.append("c.district=%s")
+        values.append(district)
+    where_clause = " AND ".join(filters)
+    with get_conn() as conn:
+        row = conn.execute(
+            f"""
+            SELECT
+                COUNT(DISTINCT c.id)::int AS active_monitored_cases,
+                COUNT(DISTINCT alert_row.id) FILTER (WHERE alert_row.status='open')::int AS new_alerts,
+                COUNT(DISTINCT c.id) FILTER (WHERE state_row.state IN ('high', 'critical'))::int AS high_priority_cases,
+                COUNT(DISTINCT alert_row.id) FILTER (WHERE alert_row.status='open' AND alert_row.requires_human_review)::int AS awaiting_review,
+                COUNT(DISTINCT intervention_row.id) FILTER (WHERE intervention_row.status IN ('planned', 'in_progress'))::int AS active_interventions
+            FROM case_contexts c
+            LEFT JOIN LATERAL (
+                SELECT state FROM dynamic_distress_states WHERE case_id=c.id
+                ORDER BY computed_at DESC, id DESC LIMIT 1
+            ) state_row ON TRUE
+            LEFT JOIN monitoring_alerts alert_row ON alert_row.case_id=c.id
+            LEFT JOIN intervention_records intervention_row ON intervention_row.case_id=c.id
+            WHERE {where_clause}
+            """,
+            values,
+        ).fetchone()
+    return {key: int(row.get(key) or 0) for key in (
+        "active_monitored_cases", "new_alerts", "high_priority_cases", "awaiting_review", "active_interventions"
+    )}
 
 def _get_user_memories_sync(
     user_id: int,
@@ -4712,6 +5673,11 @@ async def build_llm_context(
     conversation_id=None,
 ) -> List[dict]:
 
+    # Preserve the original text for the conversation and model prompt.  The
+    # normalized form is used only to improve bounded memory retrieval across
+    # Hinglish, Romanized Indic text, harmless slang, and code-switching.
+    retrieval_query = normalize_for_understanding(current_message).normalized_for_context
+
     (
         recent,
         summaries,
@@ -4722,6 +5688,7 @@ async def build_llm_context(
         memories,
         conversation_summary,
         other_conversation_summaries,
+        dynamic_distress_state,
     ) = await asyncio.gather(
         get_recent_messages(
             user_id,
@@ -4755,18 +5722,19 @@ async def build_llm_context(
             user_id,
             conversation_id,
         ),
+        get_latest_dynamic_distress_state(user_id),
     )
 
     relevant_memories = select_relevant_memories(
         memories,
-        current_message,
+        retrieval_query,
         limit=6,
     )
     
     relevant_conversation_summaries = (
         select_relevant_conversation_summaries(
             other_conversation_summaries,
-            current_message,
+            retrieval_query,
             limit=CROSS_CONVERSATION_SUMMARY_LIMIT,
         )
     )
@@ -4889,6 +5857,13 @@ async def build_llm_context(
             "four_week_screening_trends "
             "(backend analysis, not a diagnosis): "
             f"{filtered_trends}"
+        )
+
+    if dynamic_distress_state and dynamic_distress_state.state != "unknown":
+        context_lines.append(
+            "longitudinal_monitoring_context "
+            "(decision support only, not a diagnosis; do not quote this label or score to the user): "
+            f"state={dynamic_distress_state.state}, trajectory={dynamic_distress_state.trajectory}."
         )
 
     if pending:
@@ -5238,7 +6213,7 @@ def _sniff_audio_media_type(audio_bytes: bytes) -> Optional[str]:
     return None
 
 
-async def read_validated_audio(audio: UploadFile) -> tuple[bytes, str]:
+async def read_validated_audio(audio: UploadFile) -> tuple[bytes, str, Any]:
     filename = (audio.filename or "").strip()
     suffix = Path(filename).suffix.lower()
     declared_type = _normalise_media_type(audio.content_type)
@@ -5257,9 +6232,24 @@ async def read_validated_audio(audio: UploadFile) -> tuple[bytes, str]:
     if detected_type != declared_type and not ({detected_type, declared_type} <= {"audio/mp4", "audio/m4a", "audio/x-m4a"}):
         raise HTTPException(status_code=415, detail="The audio format does not match the uploaded recording.")
 
+    inspection = inspect_audio(detected_type, audio_bytes, VOICE_FFPROBE_PATH)
+    if inspection.duration_seconds is not None and inspection.duration_seconds > MAX_AUDIO_DURATION_SECONDS:
+        raise HTTPException(status_code=413, detail="The audio recording is too long.")
+    if VOICE_REQUIRE_VERIFIED_DURATION and not inspection.duration_verified:
+        raise HTTPException(
+            status_code=422,
+            detail="Audio duration validation is unavailable for this recording format.",
+        )
+    if VOICE_REQUIRE_VERIFIED_DURATION and not inspection.codec_verified:
+        raise HTTPException(
+            status_code=422,
+            detail="Audio codec validation is unavailable for this recording format.",
+        )
+
     # Raw audio is intentionally held only for this request and never written
-    # to a file or included in application logs.
-    return audio_bytes, detected_type
+    # to a file or included in application logs. Deployments can require a
+    # trusted duration validator for every container through environment policy.
+    return audio_bytes, detected_type, inspection
 
 def _is_uncertain_transcript(value: str) -> bool:
     normalised = value.strip().lower()
@@ -5518,6 +6508,426 @@ async def update_profile(
         "status": "updated"
     }
 
+
+# ---------------------------------------------------------------------------
+# PHASE 1: NATIONAL CASE CONTEXT AND CONTRACT REGISTRIES
+# ---------------------------------------------------------------------------
+
+@app.get("/languages", response_model=LanguageRegistryResponse)
+async def get_language_registry(http_request: Request):
+    """Public capability registry; it does not claim untranslated coverage."""
+
+    enforce_rate_limit(http_request, "language-registry", limit=120, window_seconds=60)
+    languages, state_coverage = language_registry_payload()
+    return LanguageRegistryResponse(languages=languages, states_ut=state_coverage)
+
+
+@app.get("/case-context", response_model=CaseContextResponse)
+async def get_case_context(
+    http_request: Request,
+    user_id: int = Depends(get_current_user_id),
+):
+    started_at = time.perf_counter()
+    enforce_rate_limit(http_request, "case-context-read", limit=120, window_seconds=60)
+    try:
+        row = await run_db(_get_case_context_sync, user_id)
+        if row is None:
+            return CaseContextResponse(configured=False)
+        return CaseContextResponse(configured=True, **dict(row))
+    finally:
+        _log_safe_timing("case_context_read", started_at)
+
+
+@app.put("/case-context", response_model=CaseContextResponse)
+async def update_case_context(
+    data: CaseContextUpdate,
+    http_request: Request,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Store beneficiary-controlled context for the authenticated owner only."""
+
+    started_at = time.perf_counter()
+    enforce_rate_limit(http_request, "case-context-update", limit=20, window_seconds=600)
+    try:
+        try:
+            canonical_state = require_state_ut(data.state_ut)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        normalized = data.model_copy(update={"state_ut": canonical_state})
+        row = await run_db(_upsert_case_context_sync, user_id, normalized)
+        return CaseContextResponse(configured=True, **dict(row))
+    finally:
+        _log_safe_timing("case_context_update", started_at)
+
+
+@app.post("/memory/retrieval", response_model=MemoryRetrievalResponse)
+async def retrieve_owned_memory(
+    data: MemoryRetrievalRequest,
+    http_request: Request,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Bounded, relevance-ranked retrieval for the authenticated owner only."""
+
+    started_at = time.perf_counter()
+    enforce_rate_limit(http_request, "memory-retrieval", limit=60, window_seconds=60)
+    try:
+        memory_rows, summary_rows = await run_db(
+            _phase1_memory_retrieval_rows_sync,
+            user_id,
+            data.conversation_id,
+        )
+
+        normalized_query = normalize_for_understanding(data.query).normalized_for_context
+        facts, summaries = select_bounded_owned_memory(
+            user_id=user_id,
+            query=normalized_query,
+            memory_rows=memory_rows,
+            summary_rows=summary_rows,
+            max_facts=data.max_facts,
+            max_summaries=data.max_summaries,
+            char_budget=data.char_budget,
+        )
+        return MemoryRetrievalResponse(
+            facts=[
+                MemoryFact(
+                    memory_key=str(item["memory_key"]),
+                    memory_value=str(item["memory_value"]),
+                    memory_type=str(item["memory_type"]),
+                    source_conversation_id=item.get("source_conversation_id"),
+                    source_message_id=item.get("source_message_id"),
+                    source_kind=str(item.get("source_kind") or "conversation"),
+                    confidence=float(item.get("confidence") or 0),
+                    status=str(item.get("status") or "active"),
+                    observed_at=item["observed_at"],
+                )
+                for item in facts
+            ],
+            conversation_summaries=[
+                {
+                    "conversation_id": str(item["conversation_id"]),
+                    "summary_text": str(item["summary_text"]),
+                    "updated_at": item["updated_at"],
+                }
+                for item in summaries
+            ],
+            char_budget=data.char_budget,
+        )
+    finally:
+        _log_safe_timing("memory_retrieval", started_at)
+
+# ---------------------------------------------------------------------------
+# PHASE 3: AUTHORIZED SUPPORT PORTAL
+# ---------------------------------------------------------------------------
+
+@app.get("/support/cases", response_model=CaseQueueResponse)
+async def authorized_case_queue(
+    http_request: Request,
+    limit: int = Query(default=25, ge=1, le=OPERATIONAL_QUEUE_MAX_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    principal: AuthenticatedPrincipal = Depends(require_roles(
+        PlatformRole.COUNSELLOR,
+        PlatformRole.AUTHORIZED_OFFICIAL,
+        PlatformRole.ADMIN,
+    )),
+):
+    """Return only pseudonymous, explicitly authorized case summaries."""
+
+    started_at = time.perf_counter()
+    enforce_rate_limit(http_request, "support-case-queue", limit=60, window_seconds=600)
+    try:
+        rows = await run_db(_case_queue_rows_sync, principal, limit + 1, offset)
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        summaries = [
+            OperationalCaseSummary(
+                case_id=str(row["case_id"]),
+                public_case_reference=str(row["public_case_reference"]),
+                priority=normalize_priority(row.get("priority")),
+                trajectory=str(row.get("trajectory") or "unknown"),
+                reason_summary=str(row.get("reason_summary") or "Human review is pending for this case."),
+                last_evaluated_at=row.get("last_evaluated_at"),
+                last_reviewed_at=row.get("last_reviewed_at"),
+                assigned_professional=row.get("assigned_professional"),
+                pending_action=row.get("pending_action"),
+                alert_id=row.get("alert_id"),
+            )
+            for row in page_rows
+        ]
+        return CaseQueueResponse(
+            cases=summaries,
+            page={
+                "limit": limit,
+                "has_more": has_more,
+                "next_cursor": str(offset + limit) if has_more else None,
+            },
+        )
+    finally:
+        _log_safe_timing("support_case_queue", started_at)
+
+
+@app.get("/support/alerts", response_model=CaseQueueResponse)
+async def authorized_alert_queue(
+    http_request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_roles(
+        PlatformRole.COUNSELLOR,
+        PlatformRole.AUTHORIZED_OFFICIAL,
+        PlatformRole.ADMIN,
+    )),
+):
+    """A compact queue of the caller's cases with an open human-review task."""
+
+    enforce_rate_limit(http_request, "support-alert-queue", limit=60, window_seconds=600)
+    rows = await run_db(_case_queue_rows_sync, principal, OPERATIONAL_QUEUE_MAX_LIMIT, None)
+    alerts = [row for row in rows if row.get("pending_action") == "Review alert"]
+    return CaseQueueResponse(
+        cases=[
+            OperationalCaseSummary(
+                case_id=str(row["case_id"]), public_case_reference=str(row["public_case_reference"]),
+                priority=normalize_priority(row.get("priority")), trajectory=str(row.get("trajectory") or "unknown"),
+                reason_summary=str(row.get("reason_summary") or "Human review is pending for this case."),
+                last_evaluated_at=row.get("last_evaluated_at"), last_reviewed_at=row.get("last_reviewed_at"),
+                assigned_professional=row.get("assigned_professional"), pending_action="Review alert", alert_id=row.get("alert_id"),
+            )
+            for row in alerts
+        ],
+        page={"limit": OPERATIONAL_QUEUE_MAX_LIMIT, "has_more": False, "next_cursor": None},
+    )
+
+
+@app.get("/support/cases/{case_id}", response_model=CaseDetailResponse)
+async def authorized_case_detail(
+    case_id: str,
+    http_request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_roles(
+        PlatformRole.COUNSELLOR,
+        PlatformRole.AUTHORIZED_OFFICIAL,
+        PlatformRole.ADMIN,
+    )),
+):
+    """Show the minimum necessary, non-conversation case decision-support view."""
+
+    enforce_rate_limit(http_request, "support-case-detail", limit=120, window_seconds=600)
+    await require_case_access(principal, case_id, "case_summary")
+    row, assessment_rows = await asyncio.gather(
+        run_db(_case_detail_row_sync, case_id),
+        run_db(_case_assessments_sync, case_id),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Case not available.")
+    indicators = _decode_json_array(row.get("contributing_indicators"))
+    await write_safe_audit(
+        principal.user_id, "case_viewed", case_id=case_id, resource_type="case_summary",
+        resource_id=case_id, metadata={"view": "minimum_necessary"},
+    )
+    return CaseDetailResponse(
+        case_id=str(row["case_id"]),
+        public_case_reference=str(row["public_case_reference"]),
+        state_ut=str(row["state_ut"]), district=row.get("district"),
+        priority=normalize_priority(row.get("priority")), trajectory=str(row.get("trajectory") or "unknown"),
+        reason_summary=concise_reason_summary(indicators, str(row.get("reason_summary") or "No pending human review task.")),
+        last_evaluated_at=row.get("last_evaluated_at"), last_reviewed_at=row.get("last_reviewed_at"),
+        assigned_professional=row.get("assigned_professional"), pending_action=row.get("pending_action"),
+        alert_id=row.get("alert_id"),
+        assessment_history=[
+            {"assessment_type": item["assessment_type"], "score": item["total"], "completed_at": item.get("completed_at")}
+            for item in assessment_rows if item.get("total") is not None
+        ],
+        contributing_indicators=indicators,
+        confidence=row.get("confidence"), data_period_start=row.get("data_period_start"), data_period_end=row.get("data_period_end"),
+    )
+
+
+@app.put("/support/cases/{case_id}/assignment", response_model=CaseAssignmentResponse)
+async def assign_case(
+    case_id: str,
+    data: CaseAssignmentRequest,
+    http_request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_roles(PlatformRole.AUTHORIZED_OFFICIAL, PlatformRole.ADMIN)),
+):
+    enforce_rate_limit(http_request, "support-case-assignment", limit=30, window_seconds=600)
+    await require_case_access(principal, case_id, "case_manage")
+    if not await run_db(_is_staff_user_sync, data.assigned_to_user_id):
+        raise HTTPException(status_code=422, detail="Assigned account must be an authorized support user.")
+    assignment = await run_db(_assign_case_sync, case_id, principal.user_id, data.assigned_to_user_id)
+    await write_safe_audit(
+        principal.user_id, "case_assigned", case_id=case_id, resource_type="case_assignment",
+        resource_id=str(data.assigned_to_user_id), metadata={"action": "assigned"},
+    )
+    return CaseAssignmentResponse(**dict(assignment))
+
+
+@app.post("/support/alerts/{alert_id}/review", response_model=AlertReviewResponse)
+async def review_alert(
+    alert_id: int,
+    data: AlertReviewRequest,
+    http_request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_roles(
+        PlatformRole.COUNSELLOR,
+        PlatformRole.AUTHORIZED_OFFICIAL,
+        PlatformRole.ADMIN,
+    )),
+):
+    enforce_rate_limit(http_request, "support-alert-review", limit=60, window_seconds=600)
+    case_id = await run_db(_alert_case_id_sync, alert_id)
+    if not case_id:
+        raise HTTPException(status_code=404, detail="Alert not available.")
+    await require_case_access(principal, case_id, "case_summary")
+    review = await run_db(_review_alert_sync, alert_id, case_id, principal.user_id, data.decision.value, data.note)
+    await write_safe_audit(
+        principal.user_id, "alert_reviewed", case_id=case_id, resource_type="monitoring_alert",
+        resource_id=str(alert_id), metadata={"decision": data.decision.value},
+    )
+    return AlertReviewResponse(**dict(review))
+
+
+@app.get("/support/cases/{case_id}/interventions", response_model=List[InterventionResponse])
+async def list_case_interventions(
+    case_id: str,
+    http_request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_roles(
+        PlatformRole.COUNSELLOR,
+        PlatformRole.AUTHORIZED_OFFICIAL,
+        PlatformRole.ADMIN,
+    )),
+):
+    enforce_rate_limit(http_request, "support-interventions-read", limit=120, window_seconds=600)
+    await require_case_access(principal, case_id, "case_summary")
+    return [InterventionResponse(**dict(row)) for row in await run_db(_list_interventions_sync, case_id)]
+
+
+@app.post("/support/cases/{case_id}/interventions", response_model=InterventionResponse, status_code=status.HTTP_201_CREATED)
+async def create_case_intervention(
+    case_id: str,
+    data: InterventionCreate,
+    http_request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_roles(
+        PlatformRole.COUNSELLOR,
+        PlatformRole.AUTHORIZED_OFFICIAL,
+        PlatformRole.ADMIN,
+    )),
+):
+    enforce_rate_limit(http_request, "support-intervention-create", limit=30, window_seconds=600)
+    await require_case_access(principal, case_id, "intervention_update")
+    if data.assigned_to_user_id is not None and not await run_db(_is_staff_user_sync, data.assigned_to_user_id):
+        raise HTTPException(status_code=422, detail="Assigned account must be an authorized support user.")
+    row = await run_db(_create_intervention_sync, case_id, principal.user_id, data)
+    await write_safe_audit(
+        principal.user_id, "intervention_created", case_id=case_id, resource_type="intervention",
+        resource_id=str(row["id"]), metadata={"category": data.intervention_type.value},
+    )
+    return InterventionResponse(**dict(row))
+
+
+@app.patch("/support/cases/{case_id}/interventions/{intervention_id}", response_model=InterventionResponse)
+async def update_case_intervention(
+    case_id: str,
+    intervention_id: int,
+    data: InterventionUpdate,
+    http_request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_roles(
+        PlatformRole.COUNSELLOR,
+        PlatformRole.AUTHORIZED_OFFICIAL,
+        PlatformRole.ADMIN,
+    )),
+):
+    enforce_rate_limit(http_request, "support-intervention-update", limit=60, window_seconds=600)
+    await require_case_access(principal, case_id, "intervention_update")
+    if data.assigned_to_user_id is not None and not await run_db(_is_staff_user_sync, data.assigned_to_user_id):
+        raise HTTPException(status_code=422, detail="Assigned account must be an authorized support user.")
+    row = await run_db(_update_intervention_sync, case_id, intervention_id, data)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Intervention not available.")
+    await write_safe_audit(
+        principal.user_id, "intervention_updated", case_id=case_id, resource_type="intervention",
+        resource_id=str(intervention_id), metadata={"status": data.status.value if data.status else "updated"},
+    )
+    return InterventionResponse(**dict(row))
+
+
+@app.get("/support/cases/{case_id}/notes", response_model=List[CaseNoteResponse])
+async def list_case_notes(
+    case_id: str,
+    http_request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_roles(
+        PlatformRole.COUNSELLOR,
+        PlatformRole.AUTHORIZED_OFFICIAL,
+        PlatformRole.ADMIN,
+    )),
+):
+    enforce_rate_limit(http_request, "support-case-notes-read", limit=120, window_seconds=600)
+    await require_case_access(principal, case_id, "case_summary")
+    return [CaseNoteResponse(**dict(row)) for row in await run_db(_list_case_notes_sync, case_id)]
+
+
+@app.post("/support/cases/{case_id}/notes", response_model=CaseNoteResponse, status_code=status.HTTP_201_CREATED)
+async def create_case_note(
+    case_id: str,
+    data: CaseNoteCreate,
+    http_request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_roles(
+        PlatformRole.COUNSELLOR,
+        PlatformRole.AUTHORIZED_OFFICIAL,
+        PlatformRole.ADMIN,
+    )),
+):
+    enforce_rate_limit(http_request, "support-case-note-create", limit=30, window_seconds=600)
+    await require_case_access(principal, case_id, "case_summary")
+    row = await run_db(_create_case_note_sync, case_id, principal.user_id, data.note)
+    await write_safe_audit(
+        principal.user_id, "case_note_created", case_id=case_id, resource_type="case_note",
+        resource_id=str(row["id"]), metadata={"note_recorded": True},
+    )
+    return CaseNoteResponse(**dict(row))
+
+
+@app.get("/support/aggregates", response_model=OperationalAggregateResponse)
+async def operational_aggregates(
+    http_request: Request,
+    level: AggregateLevel = Query(...),
+    state_ut: Optional[str] = Query(default=None),
+    district: Optional[str] = Query(default=None, max_length=160),
+    principal: AuthenticatedPrincipal = Depends(require_roles(PlatformRole.AUTHORIZED_OFFICIAL, PlatformRole.ADMIN)),
+):
+    """Return count-suppressed operational data, never personal data."""
+
+    enforce_rate_limit(http_request, "support-aggregates", limit=60, window_seconds=600)
+    normalized_state = require_state_ut(state_ut) if state_ut else None
+    if level == AggregateLevel.DISTRICT and (not normalized_state or not district):
+        raise HTTPException(status_code=422, detail="District aggregates require State/UT and district.")
+    if level == AggregateLevel.STATE_UT and (not normalized_state or district):
+        raise HTTPException(status_code=422, detail="State/UT aggregates require State/UT only.")
+    if level == AggregateLevel.NATIONAL and (normalized_state or district):
+        raise HTTPException(status_code=422, detail="National aggregates do not accept geography filters.")
+    if not await run_db(_aggregate_scope_sync, principal, level.value, normalized_state, district):
+        raise HTTPException(status_code=403, detail="This account is not permitted to view this aggregate scope.")
+    counts = await run_db(_operational_aggregate_counts_sync, normalized_state, district)
+    await write_safe_audit(
+        principal.user_id, "aggregate_viewed", resource_type="aggregate", resource_id=level.value,
+        metadata={"state_ut": normalized_state or "", "district": district or ""},
+    )
+    return OperationalAggregateResponse(
+        level=level, state_ut=normalized_state, district=district,
+        minimum_cell_count=OPERATIONAL_MINIMUM_CELL_COUNT,
+        metrics=[{"key": key, **suppress_small_cell(value, OPERATIONAL_MINIMUM_CELL_COUNT)} for key, value in counts.items()],
+        generated_at=datetime.now(timezone.utc),
+    )
+
+
+@app.get("/support/integrations", response_model=List[IntegrationAdapterStatus])
+async def external_case_adapter_status(
+    http_request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_roles(PlatformRole.ADMIN)),
+):
+    """Expose configuration state only; this route performs no external sync."""
+
+    enforce_rate_limit(http_request, "support-integrations", limit=30, window_seconds=600)
+    await write_safe_audit(principal.user_id, "integration_status_viewed", resource_type="integration", resource_id=None)
+    return [
+        IntegrationAdapterStatus(**integration_status("nhaa")),
+        IntegrationAdapterStatus(**integration_status("integrated_portal")),
+        IntegrationAdapterStatus(**integration_status("manual_demo")),
+    ]
+
 # ---------------------------------------------------------------------------
 # CHAT
 # ---------------------------------------------------------------------------
@@ -5564,7 +6974,7 @@ async def chat(
 
     # Persist the user turn before invoking the external model. A transient
     # model failure must not erase an already created conversation or message.
-    await save_message(user_id, "user", message_text, conversation_id)
+    user_message_id = await save_message(user_id, "user", message_text, conversation_id)
 
     try:
         analysis = await run_nlp_analysis(context)
@@ -5772,8 +7182,33 @@ async def chat(
         requires_escalation=emergency,
     )
 
+    distress_state = None
+    try:
+        event_id = await create_wellbeing_event(
+            user_id=user_id,
+            source_type="text",
+            raw_signals={
+                "primary_emotion": primary_emotion,
+                "emotion_confidence": analysis.emotion_confidence,
+                "emotion_severity": emotion_severity,
+                "risk_category": risk_details["risk_category"],
+                "emergency": emergency,
+                "assessment_trajectory": trajectory,
+                "speech_detected": False,
+                "acoustic_available": False,
+            },
+            source_reference=str(user_message_id),
+            conversation_id=conversation_id,
+        )
+        distress_state = await compute_and_store_dynamic_distress_state(user_id, event_id)
+    except Exception as exc:
+        # The conversation remains available if a post-analysis monitoring
+        # write is temporarily unavailable. No user content is logged.
+        logger.warning("Wellbeing event processing skipped: %s", type(exc).__name__)
+
     return ChatResponse(
         message_id=str(assistant_message_id),
+        user_message_id=str(user_message_id),
         reply=reply,
         conversation_id=conversation_id,
         emotion=emotion,
@@ -5785,6 +7220,7 @@ async def chat(
         risk_category=risk_details["risk_category"],
         emergency_detected=emergency,
         escalation_created=escalation_created,
+        distress_state=distress_state,
     )
 
 
@@ -6071,6 +7507,8 @@ async def pause_screening(
     )
 
     if not success:
+        # Covers a rare race where session state changed between
+        # checking it and updating it.
         raise HTTPException(
             status_code=409,
             detail="Session state changed and could not be paused.",
@@ -6144,28 +7582,36 @@ async def get_analytics(
     days: int = Query(default=28, ge=7, le=MAX_ANALYTICS_DAYS),
     user_id: int = Depends(get_current_user_id),
 ):
+    started_at = time.perf_counter()
     enforce_rate_limit(http_request, "analytics", limit=60, window_seconds=600)
-    totals = await get_latest_finalized_totals(user_id)
-    weekly = await get_latest_weekly_aggregate(user_id)
-    trends = await compute_four_week_trends(user_id)
-    trajectory = await compute_trajectory(
-        user_id,
-        totals,
-    )
-    snapshot = await get_analytics_snapshot(user_id, days)
-    period_end = datetime.now(timezone.utc)
-    period_start = period_end - timedelta(days=days)
+    try:
+        totals = await get_latest_finalized_totals(user_id)
+        weekly = await get_latest_weekly_aggregate(user_id)
+        trends = await compute_four_week_trends(user_id)
+        trajectory = await compute_trajectory(
+            user_id,
+            totals,
+        )
+        snapshot, monitoring = await asyncio.gather(
+            get_analytics_snapshot(user_id, days),
+            get_longitudinal_monitoring_payload(user_id),
+        )
+        period_end = datetime.now(timezone.utc)
+        period_start = period_end - timedelta(days=days)
 
-    return {
-        "screening_totals": totals,
-        "weekly_averages": weekly.model_dump(),
-        "four_week_trends": trends,
-        "trajectory": trajectory,
-        "period_days": days,
-        "period_start": period_start.isoformat(),
-        "period_end": period_end.isoformat(),
-        **snapshot,
-    }
+        return {
+            "screening_totals": totals,
+            "weekly_averages": weekly.model_dump(),
+            "four_week_trends": trends,
+            "trajectory": trajectory,
+            "period_days": days,
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
+            **snapshot,
+            **monitoring,
+        }
+    finally:
+        _log_safe_timing("analytics_read", started_at)
 
 
 # ---------------------------------------------------------------------------
@@ -6177,44 +7623,52 @@ async def wellbeing_report(
     http_request: Request,
     user_id: int = Depends(get_current_user_id),
 ):
+    started_at = time.perf_counter()
     enforce_rate_limit(http_request, "report", limit=20, window_seconds=600)
-    totals = await get_latest_finalized_totals(user_id)
-    weekly = await get_latest_weekly_aggregate(user_id)
-    trends = await compute_four_week_trends(user_id)
-    trajectory = await compute_trajectory(
-        user_id,
-        totals,
-    )
-    pending = await get_pending_score_items(user_id)
-    emotions = await get_recent_emotions(user_id)
-    recommendations = await list_recommendations(user_id)
-    measurements = await get_latest_measurements(user_id)
-    latest_risk = await get_latest_risk(user_id)
+    try:
+        totals = await get_latest_finalized_totals(user_id)
+        weekly = await get_latest_weekly_aggregate(user_id)
+        trends = await compute_four_week_trends(user_id)
+        trajectory = await compute_trajectory(
+            user_id,
+            totals,
+        )
+        pending, emotions, recommendations, measurements, latest_risk, monitoring = await asyncio.gather(
+            get_pending_score_items(user_id),
+            get_recent_emotions(user_id),
+            list_recommendations(user_id),
+            get_latest_measurements(user_id),
+            get_latest_risk(user_id),
+            get_longitudinal_monitoring_payload(user_id),
+        )
 
-    return {
-        "generated_at": _iso_timestamp(),
-        "screening_totals": totals,
-        "weekly_averages": weekly.model_dump(),
-        "four_week_trends": trends,
-        "trajectory": trajectory,
-        "pending_score_items": pending,
-        "assessment_results": [
-            {
-                "assessment_type": row["assessment_type"],
-                "total": row["total"],
-                "severity": interpret_assessment_total(row["assessment_type"], int(row["total"])),
-                "completed_at": row["completed_at"],
-            }
-            for row in measurements
-        ],
-        "emotional_patterns": [dict(row) for row in emotions],
-        "recommendations": [dict(row) for row in recommendations],
-        "risk": RiskResponse(
-            level=latest_risk["risk_category"] if latest_risk is not None else "UNKNOWN",
-            requires_escalation=bool(latest_risk["emergency_flag"]) if latest_risk is not None else False,
-        ),
-        "safety_status": "screening results are not a diagnosis",
-    }
+        return {
+            "generated_at": _iso_timestamp(),
+            "screening_totals": totals,
+            "weekly_averages": weekly.model_dump(),
+            "four_week_trends": trends,
+            "trajectory": trajectory,
+            "pending_score_items": pending,
+            "assessment_results": [
+                {
+                    "assessment_type": row["assessment_type"],
+                    "total": row["total"],
+                    "severity": interpret_assessment_total(row["assessment_type"], int(row["total"])),
+                    "completed_at": row["completed_at"],
+                }
+                for row in measurements
+            ],
+            "emotional_patterns": [dict(row) for row in emotions],
+            "recommendations": [dict(row) for row in recommendations],
+            "risk": RiskResponse(
+                level=latest_risk["risk_category"] if latest_risk is not None else "UNKNOWN",
+                requires_escalation=bool(latest_risk["emergency_flag"]) if latest_risk is not None else False,
+            ),
+            "safety_status": "screening results are not a diagnosis",
+            **monitoring,
+        }
+    finally:
+        _log_safe_timing("report_read", started_at)
 
 @app.get("/account/export")
 async def export_user_data(
@@ -6403,7 +7857,7 @@ async def voice_chat(
             detail="Unsupported language.",
         )
 
-    audio_bytes, mime_type = (
+    audio_bytes, mime_type, audio_inspection = (
         await read_validated_audio(audio)
     )
 
@@ -6432,8 +7886,8 @@ async def voice_chat(
         )
 
     chat_payload = ChatRequest(
-        user_message=transcript,
-        conversation_id=conversation_id,
+        message=transcript,
+        conversationId=conversation_id,
         preferred_language=preferred_language,
         sleep_hours=sleep_hours,
         deepface_emotion=deepface_emotion,
@@ -6447,9 +7901,53 @@ async def voice_chat(
         user_id=user_id,
     )
 
+    text_emotion = result.emotion.model_dump() if result.emotion else None
+    combined_emotion = None
+    if voice_analysis.primary_emotion:
+        combined_emotion = {
+            "primary": voice_analysis.primary_emotion,
+            "confidence": voice_analysis.emotion_confidence,
+            "intensity": voice_analysis.emotion_intensity,
+            "source": "voice-context-provider",
+        }
+    phase2_voice = Phase2VoiceAnalysisResponse(
+        transcript=transcript,
+        text_emotion=text_emotion,
+        # A dedicated acoustic provider is not configured in this application.
+        # Do not label a generic voice-context result as acoustic analysis.
+        acoustic_emotion=None,
+        acoustic_status="unavailable",
+        combined_emotion=combined_emotion,
+        safety=None,
+        duration_seconds=audio_inspection.duration_seconds,
+    )
+    voice_distress_state = result.distress_state
+    try:
+        voice_event_id = await create_wellbeing_event(
+            user_id=user_id,
+            source_type="voice",
+            raw_signals={
+                "primary_emotion": voice_analysis.primary_emotion,
+                "emotion_confidence": voice_analysis.emotion_confidence,
+                "emotion_severity": voice_analysis.emotion_intensity,
+                "speech_detected": True,
+                "acoustic_available": False,
+            },
+            source_reference=result.user_message_id,
+            conversation_id=result.conversation_id,
+        )
+        voice_distress_state = await compute_and_store_dynamic_distress_state(user_id, voice_event_id)
+    except Exception as exc:
+        logger.warning("Voice wellbeing event processing skipped: %s", type(exc).__name__)
+
+    # Transcript is returned so the frontend can
+    # keep it hidden and reveal it only when the
+    # user presses "Transcribe".
     return result.model_copy(
         update={
             "transcript": transcript,
+            "voice_analysis": phase2_voice,
+            "distress_state": voice_distress_state,
         }
     )
 
@@ -6468,7 +7966,7 @@ async def voice_transcribe(
 
     require_voice_transcription_consent(user_id)
 
-    audio_bytes, mime_type = await read_validated_audio(audio)
+    audio_bytes, mime_type, _ = await read_validated_audio(audio)
 
     analysis = await transcribe_audio(
         audio_bytes,
@@ -6564,6 +8062,22 @@ async def submit_screening_answer(
             emergency=False,
         )
         await save_risk_assessment(user_id, risk_details, totals)
+        try:
+            event_id = await create_wellbeing_event(
+                user_id=user_id,
+                source_type="assessment",
+                raw_signals={
+                    "risk_category": risk_details["risk_category"],
+                    "assessment_trajectory": trajectory,
+                    "emergency": False,
+                },
+                source_reference=session_id,
+                conversation_id=session.get("conversation_id"),
+                assessment_id=session_id,
+            )
+            await compute_and_store_dynamic_distress_state(user_id, event_id)
+        except Exception as exc:
+            logger.warning("Assessment wellbeing event processing skipped: %s", type(exc).__name__)
 
     return {
         "session_id": session_id,
