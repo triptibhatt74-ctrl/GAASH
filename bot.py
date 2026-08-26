@@ -4240,7 +4240,7 @@ def _delete_conversation_sync(
             SELECT id
             FROM conversations
             WHERE user_id = %s
-              AND coversation_id = %s
+              AND conversation_id = %s
             """,
             (
                 user_id,
