@@ -4292,7 +4292,7 @@ def _delete_conversation_sync(
             """
             DELETE FROM conversations
             WHERE user_id = %s
-              AND id = %s
+              AND conversation_id = %s
             """,
             (
                 user_id,
