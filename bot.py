@@ -72,6 +72,7 @@ from google import genai
 from google.genai import types
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 from psycopg_pool import ConnectionPool
+from huggingface_hub import InferenceClient
 
 # Configuration
 
@@ -195,10 +196,40 @@ CRISIS_PATHWAY_LABEL = os.environ.get(
 CRISIS_PATHWAY_URL = os.environ.get("CRISIS_PATHWAY_URL", "")
 CRISIS_CONTACTS_RAW = os.environ.get("CRISIS_CONTACTS", "")
 
-DEEPFACE_ENABLED = os.environ.get("DEEPFACE_ENABLED", "true").lower() == "true"
-DEEPFACE_DETECTOR_BACKEND = os.environ.get("DEEPFACE_DETECTOR_BACKEND", "opencv")
-DEEPFACE_TIMEOUT_SECONDS = float(os.environ.get("DEEPFACE_TIMEOUT_SECONDS", "15"))
-DEEPFACE_MAX_CONCURRENCY = max(1, int(os.environ.get("DEEPFACE_MAX_CONCURRENCY", "1")))
+HF_VISION_ENABLED = (
+    os.environ.get(
+        "HF_VISION_ENABLED",
+        "true",
+    ).lower()
+    == "true"
+)
+
+HF_TOKEN = os.environ.get(
+    "HF_TOKEN",
+    "",
+).strip()
+
+HF_EMOTION_MODEL = os.environ.get(
+    "HF_EMOTION_MODEL",
+    "",
+).strip()
+
+HF_VISION_TIMEOUT_SECONDS = float(
+    os.environ.get(
+        "HF_VISION_TIMEOUT_SECONDS",
+        "15",
+    )
+)
+
+HF_VISION_MAX_CONCURRENCY = max(
+    1,
+    int(
+        os.environ.get(
+            "HF_VISION_MAX_CONCURRENCY",
+            "2",
+        )
+    ),
+)
 
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8001"))
@@ -263,7 +294,9 @@ app.add_middleware(
 )
 
 logger = logging.getLogger("gaash")
-_DEEPFACE_SEMAPHORE = asyncio.Semaphore(DEEPFACE_MAX_CONCURRENCY)
+_HF_VISION_SEMAPHORE = asyncio.Semaphore(
+    HF_VISION_MAX_CONCURRENCY
+)
 
 _RATE_LIMIT_BUCKETS: Dict[tuple[str, str], List[float]] = {}
 _RATE_LIMIT_LOCK = threading.Lock()
@@ -5533,12 +5566,95 @@ def append_crisis_pathway(response_to_user, pathway) -> str:
 # Visual emotion analysis (DeepFace) — contextual only, never risk input
 # ---------------------------------------------------------------------------
 
-_MAX_FRAME_BYTES = 8 * 1024 * 1024
-
-
-class DeepFrameRuntimeError(Exception):
+class VisionAnalysisRuntimeError(Exception):
     pass
 
+
+def _get_hf_vision_client() -> InferenceClient:
+    if not HF_TOKEN:
+        raise VisionAnalysisRuntimeError(
+            "HF_TOKEN is not configured."
+        )
+
+    if not HF_EMOTION_MODEL:
+        raise VisionAnalysisRuntimeError(
+            "HF_EMOTION_MODEL is not configured."
+        )
+
+    return InferenceClient(
+        provider="hf-inference",
+        api_key=HF_TOKEN,
+    )
+
+
+def _analyze_frame_sync(
+    image_bytes: bytes,
+) -> dict:
+    try:
+        client = _get_hf_vision_client()
+
+        predictions = client.image_classification(
+            image_bytes,
+            model=HF_EMOTION_MODEL,
+        )
+
+    except Exception as exc:
+        logger.warning(
+            "Hugging Face visual analysis failed: %s",
+            type(exc).__name__,
+        )
+
+        raise VisionAnalysisRuntimeError(
+            type(exc).__name__
+        ) from exc
+
+    if not predictions:
+        raise ValueError(
+            "No facial-emotion result was returned."
+        )
+
+    scores: Dict[str, float] = {}
+
+    for prediction in predictions:
+        label = str(
+            getattr(
+                prediction,
+                "label",
+                "",
+            )
+            or ""
+        ).strip().lower()
+
+        score = getattr(
+            prediction,
+            "score",
+            None,
+        )
+
+        if not label or score is None:
+            continue
+
+        scores[label] = round(
+            float(score) * 100,
+            2,
+        )
+
+    if not scores:
+        raise ValueError(
+            "No usable facial-emotion result was returned."
+        )
+
+    dominant_emotion = max(
+        scores,
+        key=scores.get,
+    )
+
+    return {
+        "dominant_emotion": dominant_emotion,
+        "emotion_scores": scores,
+    }
+
+_MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 def _decode_base64_image(image_base64: str) -> bytes:
     payload = image_base64.strip()
@@ -5555,67 +5671,102 @@ def _decode_base64_image(image_base64: str) -> bytes:
     return raw
 
 
-def _analyze_frame_sync(image_bytes: bytes) -> dict:
-    import numpy as np
-    from deepface import DeepFace
-    from PIL import Image, UnidentifiedImageError
-    try:
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            frame = np.array(image.convert("RGB"))[:, :, ::-1]
-    except (UnidentifiedImageError, OSError) as exc:
-        raise ValueError("The supplied data is not a readable image.") from exc
-    try:
-        result = DeepFace.analyze(
-            img_path=frame, actions=["emotion"],
-            detector_backend=DEEPFACE_DETECTOR_BACKEND,
-            enforce_detection=False, silent=True,
-        )
-    except Exception as exc:
-        logger.warning("DeepFace analysis failed: %s", type(exc).__name__)
-        raise DeepFrameRuntimeError(type(exc).__name__) from exc
-    if isinstance(result, list):
-        if not result:
-            raise ValueError("No face could be analysed in the supplied frame.")
-        result = result[0]
-    scores = {k: round(float(v), 2) for k, v in result.get("emotion", {}).items()}
-    return {"dominant_emotion": result.get("dominant_emotion"), "emotion_scores": scores}
+async def analyze_frame(
+    image_base64: str,
+) -> AnalyzeFrameResponse:
 
-
-async def analyze_frame(image_base64: str) -> AnalyzeFrameResponse:
-    if not DEEPFACE_ENABLED:
+    if not HF_VISION_ENABLED:
         return AnalyzeFrameResponse(
             dominant_emotion=None,
             emotion_scores={},
             ok=False,
-            error="Visual emotion analysis is disabled.",
+            error=(
+                "Visual emotion analysis "
+                "is disabled."
+            ),
         )
+
     try:
-        image_bytes = _decode_base64_image(image_base64)
+        image_bytes = _decode_base64_image(
+            image_base64
+        )
+
     except ValueError as exc:
-        return AnalyzeFrameResponse(dominant_emotion=None, emotion_scores={}, ok=False, error=str(exc))
-    try:
-        async with _DEEPFACE_SEMAPHORE:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(_analyze_frame_sync, image_bytes),
-                timeout=DEEPFACE_TIMEOUT_SECONDS,
-            )
-    except TimeoutError:
-        logger.warning("DeepFace analysis timed out")
-        return AnalyzeFrameResponse(dominant_emotion=None, emotion_scores={}, ok=False, error="Visual emotion analysis timed out.")
-    except ImportError as exc:
-        logger.warning("DeepFace unavailable: %s", exc)
         return AnalyzeFrameResponse(
-            dominant_emotion=None, emotion_scores={}, ok=False,
-            error="Visual emotion analysis is temporarily unavailable.",
+            dominant_emotion=None,
+            emotion_scores={},
+            ok=False,
+            error=str(exc),
         )
+
+    try:
+        async with _HF_VISION_SEMAPHORE:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _analyze_frame_sync,
+                    image_bytes,
+                ),
+                timeout=HF_VISION_TIMEOUT_SECONDS,
+            )
+
+    except TimeoutError:
+        logger.warning(
+            "Hugging Face visual analysis timed out"
+        )
+
+        return AnalyzeFrameResponse(
+            dominant_emotion=None,
+            emotion_scores={},
+            ok=False,
+            error=(
+                "Visual emotion analysis timed out."
+            ),
+        )
+
+    except VisionAnalysisRuntimeError:
+        return AnalyzeFrameResponse(
+            dominant_emotion=None,
+            emotion_scores={},
+            ok=False,
+            error=(
+                "Visual emotion analysis is "
+                "temporarily unavailable."
+            ),
+        )
+
     except ValueError as exc:
-        return AnalyzeFrameResponse(dominant_emotion=None, emotion_scores={}, ok=False, error=str(exc))
-    except DeepFrameRuntimeError:
-        return AnalyzeFrameResponse(dominant_emotion=None, emotion_scores={}, ok=False, error="Visual emotion analysis is temporarily unavailable.")
+        return AnalyzeFrameResponse(
+            dominant_emotion=None,
+            emotion_scores={},
+            ok=False,
+            error=str(exc),
+        )
+
     except Exception:
-        logger.warning("Unexpected visual emotion analysis failure")
-        return AnalyzeFrameResponse(dominant_emotion=None, emotion_scores={}, ok=False, error="Visual emotion analysis is temporarily unavailable.")
-    return AnalyzeFrameResponse(dominant_emotion=result["dominant_emotion"], emotion_scores=result["emotion_scores"], ok=True, error=None)
+        logger.warning(
+            "Unexpected visual emotion analysis failure"
+        )
+
+        return AnalyzeFrameResponse(
+            dominant_emotion=None,
+            emotion_scores={},
+            ok=False,
+            error=(
+                "Visual emotion analysis is "
+                "temporarily unavailable."
+            ),
+        )
+
+    return AnalyzeFrameResponse(
+        dominant_emotion=result[
+            "dominant_emotion"
+        ],
+        emotion_scores=result[
+            "emotion_scores"
+        ],
+        ok=True,
+        error=None,
+    )
 
 def _pending_score_items_sync(user_id: int, include_paused: bool = True) -> List[dict]:
     with get_conn() as conn:
@@ -8004,7 +8155,7 @@ async def emotion_analysis(
     user_id: int = Depends(get_current_user_id),
 ):
     enforce_rate_limit(http_request, "visual-emotion", limit=10, window_seconds=600)
-    if not DEEPFACE_ENABLED:
+    if not HF_VISION_ENABLED:
         raise HTTPException(status_code=503, detail="Visual emotion analysis is not enabled.")
     return await analyze_frame(
         request.image_base64
