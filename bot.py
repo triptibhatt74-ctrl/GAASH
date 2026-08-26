@@ -74,6 +74,10 @@ from google.genai import types
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 from psycopg_pool import ConnectionPool
 from huggingface_hub import InferenceClient
+from transformers import AutoImageProcessor, AutoModelForImageClassification
+import torch
+from PIL import Image
+import io
 
 # Configuration
 
@@ -211,7 +215,7 @@ HF_TOKEN = os.environ.get(
 ).strip()
 
 HF_EMOTION_MODEL = os.environ.get(
-    "HF_EMOTION_MODEL",
+    "HardlyHumans/Facial-expression-detection",
     "",
 ).strip()
 
@@ -5587,67 +5591,82 @@ def _get_hf_vision_client() -> InferenceClient:
         api_key=HF_TOKEN,
     )
 
+_emotion_pipeline = None
+_emotion_model_lock = threading.Lock()
+
+
+def get_hf_emotion_model():
+    global _hf_emotion_processor
+    global _hf_emotion_model
+
+    if (
+        _hf_emotion_processor is None
+        or _hf_emotion_model is None
+    ):
+        _hf_emotion_processor = (
+            AutoImageProcessor.from_pretrained(
+                HF_EMOTION_MODEL
+            )
+        )
+
+        _hf_emotion_model = (
+            AutoModelForImageClassification.from_pretrained(
+                HF_EMOTION_MODEL
+            )
+        )
+
+        _hf_emotion_model.eval()
+
+    return (
+        _hf_emotion_processor,
+        _hf_emotion_model,
+    )
 
 def _analyze_frame_sync(
     image_bytes: bytes,
 ) -> dict:
-    try:
-        client = _get_hf_vision_client()
 
-        predictions = client.image_classification(
-            image_bytes,
-            model=HF_EMOTION_MODEL,
-        )
+    processor, model = get_hf_emotion_model()
 
-    except Exception as exc:
-        logger.warning(
-            "Hugging Face visual analysis failed: %s",
-            type(exc).__name__,
-        )
+    image = Image.open(
+        io.BytesIO(image_bytes)
+    ).convert("RGB")
 
-        raise VisionAnalysisRuntimeError(
-            type(exc).__name__
-        ) from exc
+    inputs = processor(
+        images=image,
+        return_tensors="pt",
+    )
 
-    if not predictions:
-        raise ValueError(
-            "No facial-emotion result was returned."
-        )
+    with torch.no_grad():
+        outputs = model(**inputs)
 
-    scores: Dict[str, float] = {}
+    probabilities = torch.softmax(
+        outputs.logits,
+        dim=-1,
+    )[0]
 
-    for prediction in predictions:
-        label = str(
-            getattr(
-                prediction,
-                "label",
-                "",
-            )
-            or ""
-        ).strip().lower()
+    id2label = model.config.id2label
 
-        score = getattr(
-            prediction,
-            "score",
-            None,
-        )
+    scores = {}
 
-        if not label or score is None:
-            continue
+    for index, probability in enumerate(
+        probabilities
+    ):
+        label = id2label[index].lower()
 
         scores[label] = round(
-            float(score) * 100,
+            float(probability) * 100,
             2,
         )
 
-    if not scores:
-        raise ValueError(
-            "No usable facial-emotion result was returned."
-        )
+    dominant_index = int(
+        torch.argmax(probabilities).item()
+    )
 
-    dominant_emotion = max(
-        scores,
-        key=scores.get,
+    dominant_emotion = (
+        id2label[dominant_index]
+        .lower()
+        .strip()
     )
 
     return {
