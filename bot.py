@@ -4241,6 +4241,7 @@ def _delete_conversation_sync(
             FROM conversations
             WHERE user_id = %s
               AND conversation_id = %s
+            LIMIT 1
             """,
             (
                 user_id,
