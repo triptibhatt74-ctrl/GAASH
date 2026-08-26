@@ -1,3 +1,4 @@
+from __future__ import annotations
 import contextlib
 import hashlib
 import hmac
@@ -17,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Optional
-from __future__ import annotations
+
 from enum import StrEnum
 from collections.abc import Iterable
 
