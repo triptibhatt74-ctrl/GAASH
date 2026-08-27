@@ -1171,6 +1171,9 @@ class PrivacyPolicyMetadataResponse(BaseModel):
     policy_version: str
     effective_date: str
 
+class RoleResponse(BaseModel):
+    role: PlatformRole
+    portal: str
 
 class VoiceTranscriptionConsentResponse(BaseModel):
     granted: bool
@@ -1869,6 +1872,23 @@ def reset_password(
         "message": "Password reset successfully. You can now sign in.",
     }
 
+@app.get("/auth/role", response_model=RoleResponse)
+def get_account_role(
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    if principal.role == PlatformRole.SUPPORT:
+        portal = "support"
+
+    elif principal.role == PlatformRole.ADMIN:
+        portal = "admin"
+
+    else:
+        portal = "user"
+
+    return {
+        "role": principal.role,
+        "portal": portal,
+    }
 
 @app.post(
     "/auth/logout",
