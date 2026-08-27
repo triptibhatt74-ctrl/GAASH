@@ -18,6 +18,7 @@ class AudioInspection:
     duration_verified: bool
     codec: str | None = None
     codec_verified: bool = False
+    probe_failure: str | None = None
 
 
 def inspect_wav_duration(audio_bytes: bytes) -> float | None:
@@ -84,5 +85,12 @@ def inspect_audio(container: str, audio_bytes: bytes, ffprobe_path: str = "") ->
             return inspected
     if container == "audio/wav":
         duration = inspect_wav_duration(audio_bytes)
-        return AudioInspection(container=container, duration_seconds=duration, duration_verified=duration is not None, codec="pcm", codec_verified=True)
-    return AudioInspection(container=container, duration_seconds=None, duration_verified=False, codec=None, codec_verified=False)
+
+        return AudioInspection(
+            container=container,
+            duration_seconds=duration,
+            duration_verified=duration is not None,
+            codec="pcm",
+            codec_verified=True,
+            probe_failure=None if duration is not None else "invalid_media",
+        )
