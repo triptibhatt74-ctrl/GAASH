@@ -213,7 +213,7 @@ def init_db() -> None:
                     password TEXT NOT NULL,
                     is_verified BOOLEAN NOT NULL DEFAULT FALSE,
                     role TEXT NOT NULL DEFAULT 'user'
-                        CHECK (role IN ('user', 'counsellor', 'authorized_official', 'admin')),
+                        CHECK (role IN ('user', 'support', 'authorized_official', 'admin')),
                     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -222,7 +222,14 @@ def init_db() -> None:
             cur.execute(
                 """
                 ALTER TABLE users
-                ADD COLUMN IF NOT EXISTS counsellor_id VARCHAR(30) UNIQUE
+                ADD COLUMN IF NOT EXISTS support_id VARCHAR(30) UNIQUE
+                """
+            )
+            
+            cur.execute(
+                """
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS requested_role VARCHAR(20);
                 """
             )
 
@@ -413,7 +420,7 @@ def as_utc_datetime(value: datetime | str) -> datetime:
     parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value)
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
-def generate_counsellor_id() -> str:
+def generate_support_id() -> str:
     return f"GAASH-CNS-{secrets.token_hex(4).upper()}"
 
 def create_auth_session(
@@ -1041,7 +1048,7 @@ def get_current_principal(
 
 
 def require_roles(*allowed_roles: PlatformRole):
-    """Dependency factory reserved for counsellor/official/admin routes."""
+    """Dependency factory reserved for support/official/admin routes."""
 
     if not allowed_roles:
         raise ValueError("At least one server-side role is required.")
@@ -1183,7 +1190,10 @@ class PrivacyPolicyMetadataResponse(BaseModel):
 class RoleResponse(BaseModel):
     role: PlatformRole
     portal: str
-    counsellor_id: Optional[str] = None
+    support_id: Optional[str] = None
+    
+class SelectRoleRequest(BaseModel):
+    role: str = Field(..., min_length=3, max_length=20)
 
 class VoiceTranscriptionConsentResponse(BaseModel):
     granted: bool
@@ -1225,14 +1235,14 @@ class ResetTokenResponse(BaseModel):
 class CurrentUserResponse(SafeUserResponse):
     created_at: datetime
     
-class PromoteCounsellorRequest(BaseModel):
+class PromotesupportRequest(BaseModel):
     user_id: int
 
 
-class PromoteCounsellorResponse(BaseModel):
+class PromotesupportResponse(BaseModel):
     user_id: int
     role: str
-    counsellor_id: str
+    support_id: str
 
 # ============================================================
 # ROUTES
@@ -1891,17 +1901,69 @@ def reset_password(
         "message": "Password reset successfully. You can now sign in.",
     }
 
+@app.post("/auth/select-role")
+def select_role(
+    data: SelectRoleRequest,
+    user_id: int = Depends(get_current_user_id),
+):
+    requested_role = data.role.strip().lower()
+
+    if requested_role not in {"user", "support"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported account type.",
+        )
+
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+
+            if requested_role == "user":
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET role = 'user'
+                    WHERE id = %s
+                    """,
+                    (user_id,),
+                )
+
+                conn.commit()
+
+                return {
+                    "role": "user",
+                    "status": "active",
+                    "next_step": "dashboard",
+                }
+
+            # support is NOT automatically trusted.
+            cur.execute(
+                """
+                UPDATE users
+                SET role = 'user'
+                WHERE id = %s
+                """,
+                (user_id,),
+            )
+
+        conn.commit()
+
+    return {
+        "role": "support",
+        "status": "pending_approval",
+        "next_step": "support_verification",
+    }
+
 @app.get("/auth/role", response_model=RoleResponse)
 def get_account_role(
     principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
-    counsellor_id = None
+    support_id = None
 
     with db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT counsellor_id
+                SELECT support_id
                 FROM users
                 WHERE id = %s
                 """,
@@ -1915,9 +1977,9 @@ def get_account_role(
             detail="User not found.",
         )
 
-    if principal.role == PlatformRole.COUNSELLOR:
-        portal = "counsellor"
-        counsellor_id = row[0]
+    if principal.role == PlatformRole.support:
+        portal = "support"
+        support_id = row[0]
 
     elif principal.role == PlatformRole.ADMIN:
         portal = "admin"
@@ -1928,7 +1990,7 @@ def get_account_role(
     return {
         "role": principal.role,
         "portal": portal,
-        "counsellor_id": counsellor_id,
+        "support_id": support_id,
     }
 
 @app.post(
