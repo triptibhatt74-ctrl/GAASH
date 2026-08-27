@@ -218,6 +218,13 @@ def init_db() -> None:
                 )
                 """
             )
+            
+            cur.execute(
+                """
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS counsellor_id VARCHAR(30) UNIQUE
+                """
+            )
 
             cur.execute(
                 """
@@ -406,6 +413,8 @@ def as_utc_datetime(value: datetime | str) -> datetime:
     parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value)
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
+def generate_counsellor_id() -> str:
+    return f"GAASH-CNS-{secrets.token_hex(4).upper()}"
 
 def create_auth_session(
     conn,
@@ -1174,6 +1183,7 @@ class PrivacyPolicyMetadataResponse(BaseModel):
 class RoleResponse(BaseModel):
     role: PlatformRole
     portal: str
+    counsellor_id: Optional[str] = None
 
 class VoiceTranscriptionConsentResponse(BaseModel):
     granted: bool
@@ -1214,6 +1224,15 @@ class ResetTokenResponse(BaseModel):
 
 class CurrentUserResponse(SafeUserResponse):
     created_at: datetime
+    
+class PromoteCounsellorRequest(BaseModel):
+    user_id: int
+
+
+class PromoteCounsellorResponse(BaseModel):
+    user_id: int
+    role: str
+    counsellor_id: str
 
 # ============================================================
 # ROUTES
@@ -1876,8 +1895,29 @@ def reset_password(
 def get_account_role(
     principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
-    if principal.role == PlatformRole.SUPPORT:
-        portal = "support"
+    counsellor_id = None
+
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT counsellor_id
+                FROM users
+                WHERE id = %s
+                """,
+                (principal.user_id,),
+            )
+            row = cur.fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found.",
+        )
+
+    if principal.role == PlatformRole.COUNSELLOR:
+        portal = "counsellor"
+        counsellor_id = row[0]
 
     elif principal.role == PlatformRole.ADMIN:
         portal = "admin"
@@ -1888,6 +1928,7 @@ def get_account_role(
     return {
         "role": principal.role,
         "portal": portal,
+        "counsellor_id": counsellor_id,
     }
 
 @app.post(
