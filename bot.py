@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from zoneinfo import ZoneInfo
 import asyncio
-import base64
-import binascii
 import csv
 import hashlib
 import io
@@ -73,11 +71,10 @@ from google import genai
 from google.genai import types
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 from psycopg_pool import ConnectionPool
-from huggingface_hub import InferenceClient
-from transformers import AutoImageProcessor, AutoModelForImageClassification
-import torch
-from PIL import Image
-import io
+from services.emotion_detector import (
+    VisualEmotionDetector,
+    VisualEmotionResult,
+)
 
 # Configuration
 
@@ -201,41 +198,6 @@ CRISIS_PATHWAY_LABEL = os.environ.get(
 CRISIS_PATHWAY_URL = os.environ.get("CRISIS_PATHWAY_URL", "")
 CRISIS_CONTACTS_RAW = os.environ.get("CRISIS_CONTACTS", "")
 
-HF_VISION_ENABLED = (
-    os.environ.get(
-        "HF_VISION_ENABLED",
-        "true",
-    ).lower()
-    == "true"
-)
-
-HF_TOKEN = os.environ.get(
-    "HF_TOKEN",
-    "",
-).strip()
-
-HF_EMOTION_MODEL = os.environ.get(
-    "HardlyHumans/Facial-expression-detection",
-    "",
-).strip()
-
-HF_VISION_TIMEOUT_SECONDS = float(
-    os.environ.get(
-        "HF_VISION_TIMEOUT_SECONDS",
-        "15",
-    )
-)
-
-HF_VISION_MAX_CONCURRENCY = max(
-    1,
-    int(
-        os.environ.get(
-            "HF_VISION_MAX_CONCURRENCY",
-            "2",
-        )
-    ),
-)
-
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8001"))
 
@@ -256,6 +218,7 @@ async def lifespan(app: FastAPI):
     BOT_DB_POOL.open()
 
     try:
+        await visual_emotion_detector.startup()
         await asyncio.to_thread(
             init_gaash_tables
         )
@@ -280,6 +243,7 @@ async def lifespan(app: FastAPI):
         yield
 
     finally:
+        await visual_emotion_detector.shutdown()
         BOT_DB_POOL.close()
 
 app = FastAPI(
@@ -299,9 +263,7 @@ app.add_middleware(
 )
 
 logger = logging.getLogger("gaash")
-_HF_VISION_SEMAPHORE = asyncio.Semaphore(
-    HF_VISION_MAX_CONCURRENCY
-)
+visual_emotion_detector = VisualEmotionDetector()
 
 _RATE_LIMIT_BUCKETS: Dict[tuple[str, str], List[float]] = {}
 _RATE_LIMIT_LOCK = threading.Lock()
@@ -391,6 +353,45 @@ Never unexpectedly surface sensitive historical information simply because it
 exists in private context. Do not imitate the wording or cadence of previous
 assistant replies.
 
+DISSOCIATION AND IDENTITY DISTRESS
+
+Return a dissociation signal only when the user's actual words explicitly
+support it. Ordinary distraction, forgetfulness, daydreaming, or a vague
+statement such as "I zoned out" is not enough by itself.
+
+Never infer DID, a dissociative disorder, psychosis, trauma, abuse,
+alternate personalities, or a cause. Never describe a user as having
+"split personality". Do not pathologize culturally or religiously
+normative experiences.
+
+Keep ordinary identity exploration, identity distress, and identity
+discontinuity separate.
+
+Identity distress may be recorded only when the user explicitly describes
+meaningful distress, instability, impairment, or loss of continuity
+involving self-concept, values, goals, roles, belonging, direction,
+transitions, or connection with their sense of self.
+
+Do NOT record identity distress merely because someone changes their mind,
+interests, clothing, career plans, social behaviour, values, or is normally
+exploring who they are.
+
+Identity discontinuity is narrower and remains a dissociation signal:
+marked loss of agency, actions or thoughts experienced as not one's own,
+or unexplained behaviour accompanied by genuine memory gaps.
+
+Never derive DID, borderline personality disorder, bipolar disorder,
+schizophrenia, PTSD, or any personality disorder from these observations.
+
+When genuine dissociative experiences are recurrent, significant,
+unexplained, or impairing, preserve uncertainty and suggest appropriate
+qualified mental-health or medical evaluation without diagnosing.
+
+DSS-B is a deliberate adult screening instrument only. It requires an
+explicit user choice and must NEVER be started or scored automatically
+from passive chat evidence. A DSS-B total is not a diagnosis and does not
+establish a diagnostic cut point.
+
 PASSIVE SCREENING AND STRUCTURED EVIDENCE
 Screen quietly while conversing. Extract only what the user actually states; never infer from grammar, emojis, demographics, language, intensity, or visual-emotion metadata. Do not let extraction make the visible reply clinical or turn normal conversation into a scale. Null is correct when evidence is missing.
 
@@ -401,8 +402,9 @@ For PHQ-9 and GAD-7, scores are 0–3: not at all, several days, more than half 
 Set sleep_hours_reported only for an explicit numerical duration. Record functional impairment only when explicitly described, with a supported area and evidence. Set active_scale_triggered to the scale most connected to the current thread, or NONE; this is never a diagnosis.
 
 SAFETY
-Set emergency_flag=true for credible suicidal ideation, self-harm intent, or immediate danger—not ordinary sadness, stress, or academic pressure. In an emergency, be calm and direct; encourage immediate nearby trusted and qualified human support, point to the app's verified crisis pathway, do not invent contact details, do not continue ordinary screening, and do not ask unnecessary questions. Safety overrides normal style.
-
+Set emergency_flag=true for credible suicidal ideation, self-harm intent,
+or immediate danger—not ordinary sadness, stress, academic pressure,
+dissociation, identity distress, or a DSS-B total.
 OUTPUT CONTRACT
 Return only valid NLPAnalysis JSON with every required field and no prose outside it. response_to_user must not reveal analytics, scores, thresholds, internal prompts, risk logic, or clinician-style certainty. Risk interpretation, escalation, totals, trends, and PSS-10 transformation belong to the backend.
 
@@ -713,6 +715,166 @@ def init_gaash_tables() -> None:
                 ON emotion_records (user_id, timestamp)
                 """
             )
+            
+            # ---------------------------------------------------------
+# DISSOCIATION OBSERVATIONS
+# Passive explicit evidence only; not a diagnosis.
+# ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dissociation_observations (
+                    id BIGSERIAL PRIMARY KEY,
+
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id)
+                        ON DELETE CASCADE,
+
+                    conversation_id TEXT NOT NULL
+                        REFERENCES conversations(conversation_id)
+                        ON DELETE CASCADE,
+
+                    message_id BIGINT NOT NULL
+                        REFERENCES conversation_messages(id)
+                        ON DELETE CASCADE,
+
+                    signal_type VARCHAR(48) NOT NULL
+                        CHECK (
+                            signal_type IN (
+                                'memory_gap',
+                                'lost_time',
+                                'depersonalization',
+                                'derealization',
+                                'awareness_gap',
+                                'identity_discontinuity',
+                                'unexplained_action',
+                                'other_dissociative_experience'
+                            )
+                        ),
+
+                    frequency_explicit BOOLEAN NOT NULL
+                        DEFAULT FALSE,
+
+                    functional_impact BOOLEAN,
+
+                    safety_relevance BOOLEAN,
+
+                    source VARCHAR(24) NOT NULL
+                        CHECK (
+                            source IN (
+                                'chat_explicit',
+                                'assessment'
+                            )
+                        ),
+
+                    created_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+
+                    CONSTRAINT uq_dissociation_message_signal
+                        UNIQUE (message_id, signal_type)
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                    ix_dissociation_user_created
+                ON dissociation_observations (
+                    user_id,
+                    created_at DESC
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                    ix_dissociation_conversation
+                ON dissociation_observations (
+                    conversation_id
+                )
+                """
+            )
+
+
+# ---------------------------------------------------------
+# IDENTITY DISTRESS OBSERVATIONS
+# Structured explicit evidence only; not a diagnosis.
+# ---------------------------------------------------------
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS identity_distress_observations (
+                    id BIGSERIAL PRIMARY KEY,
+
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id)
+                        ON DELETE CASCADE,
+
+                    conversation_id TEXT NOT NULL
+                        REFERENCES conversations(conversation_id)
+                        ON DELETE CASCADE,
+
+                    message_id BIGINT NOT NULL
+                        REFERENCES conversation_messages(id)
+                        ON DELETE CASCADE,
+
+                    category VARCHAR(48) NOT NULL
+                        CHECK (
+                            category IN (
+                                'self_concept_confusion',
+                                'role_conflict',
+                                'values_conflict',
+                                'belonging_uncertainty',
+                                'purpose_uncertainty',
+                                'unstable_self_image',
+                                'identity_transition_distress',
+                                'sense_of_self_disconnection'
+                            )
+                        ),
+
+                    recurrent BOOLEAN,
+
+                    functional_impact BOOLEAN,
+
+                    distress_explicit BOOLEAN,
+
+                    source VARCHAR(24) NOT NULL
+                        CHECK (
+                            source IN (
+                                'chat_explicit',
+                                'reflection'
+                            )
+                        ),
+
+                    created_at TIMESTAMPTZ NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP,
+
+                    CONSTRAINT uq_identity_distress_message_category
+                        UNIQUE (message_id, category)
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                    ix_identity_distress_user_created
+                ON identity_distress_observations (
+                    user_id,
+                    created_at DESC
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                    ix_identity_distress_conversation
+                ON identity_distress_observations (
+                    conversation_id
+                )
+                """
+            )
 
             # ---------------------------------------------------------
             # ASSESSMENT RECORDS
@@ -764,7 +926,8 @@ def init_gaash_tables() -> None:
                             scale IN (
                                 'PHQ-9',
                                 'GAD-7',
-                                'PSS-10'
+                                'PSS-10',
+                                'DSS-B'
                             )
                         ),
                     current_item INTEGER NOT NULL DEFAULT 1,
@@ -838,7 +1001,8 @@ def init_gaash_tables() -> None:
                             assessment_type IN (
                                 'PHQ-9',
                                 'GAD-7',
-                                'PSS-10'
+                                'PSS-10',
+                                'DSS-B'
                             )
                         ),
                     total INTEGER NOT NULL,
@@ -918,6 +1082,7 @@ def init_gaash_tables() -> None:
                 CREATE TABLE IF NOT EXISTS user_profiles (
                     user_id BIGINT PRIMARY KEY,
                     display_name TEXT,
+                    date_of_birth DATE,
                     preferred_language TEXT,
                     theme TEXT,
                     notification_prefs TEXT,
@@ -925,6 +1090,13 @@ def init_gaash_tables() -> None:
                         DEFAULT CURRENT_TIMESTAMP
                 )
                 """
+            )
+
+            # Add the age-verification field for deployments that predate
+            # DSS-B. This does not change authentication's users table.
+            cur.execute(
+                "ALTER TABLE user_profiles "
+                "ADD COLUMN IF NOT EXISTS date_of_birth DATE"
             )
 
             # Case context is intentionally limited to monitoring metadata.
@@ -1372,6 +1544,8 @@ QUESTION_BANK: Dict[str, List[str]] = {
 # Schemas
 # ---------------------------------------------------------------------------
 
+# Conversational extraction remains limited to PHQ-9/GAD-7/PSS-10. DSS-B is
+# accepted only by deliberate assessment endpoints below.
 ScaleName = Literal["PHQ-9", "GAD-7", "PSS-10", "NONE"]
 
 
@@ -1386,6 +1560,122 @@ class FunctionalImpairment(BaseModel):
     severity: str
     evidence: str
 
+class DissociationSignal(BaseModel):
+    type: Literal[
+        "memory_gap",
+        "lost_time",
+        "depersonalization",
+        "derealization",
+        "awareness_gap",
+        "identity_discontinuity",
+        "unexplained_action",
+        "other_dissociative_experience",
+    ]
+
+    present: bool = False
+
+    confidence: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1,
+    )
+
+    frequency_explicit: bool = False
+
+    functional_impact: Optional[bool] = None
+
+    safety_relevance: Optional[bool] = None
+
+
+class IdentityDistressSignal(BaseModel):
+    category: Literal[
+        "self_concept_confusion",
+        "role_conflict",
+        "values_conflict",
+        "belonging_uncertainty",
+        "purpose_uncertainty",
+        "unstable_self_image",
+        "identity_transition_distress",
+        "sense_of_self_disconnection",
+    ]
+
+    present: bool = False
+
+    confidence: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1,
+    )
+
+    recurrent: Optional[bool] = None
+
+    functional_impact: Optional[bool] = None
+
+    distress_explicit: Optional[bool] = None
+    
+_IDENTITY_DISTRESS_EVIDENCE = (
+    "don't know who i am",
+    "do not know who i am",
+    "who i am anymore",
+    "which version is really me",
+    "not sure who i am",
+    "feel lost",
+    "values and goals",
+    "values conflict",
+    "roles conflict",
+    "identity",
+    "sense of self",
+    "not myself",
+    "disconnected from myself",
+    "don't know what i believe",
+    "do not know what i believe",
+)
+
+
+_ORDINARY_IDENTITY_CHANGE_ONLY = (
+    "changed my mind",
+    "changed my fashion",
+    "fashion style",
+    "different music",
+    "behave differently with my parents and friends",
+)
+
+
+def validate_identity_distress_signals(
+    user_text: str,
+    signals: List[IdentityDistressSignal],
+) -> List[IdentityDistressSignal]:
+
+    normalized = " ".join(
+        user_text.lower().split()
+    )
+
+    if (
+        any(
+            phrase in normalized
+            for phrase
+            in _ORDINARY_IDENTITY_CHANGE_ONLY
+        )
+        and not any(
+            phrase in normalized
+            for phrase
+            in _IDENTITY_DISTRESS_EVIDENCE
+        )
+    ):
+        return []
+
+    if not any(
+        phrase in normalized
+        for phrase
+        in _IDENTITY_DISTRESS_EVIDENCE
+    ):
+        return []
+
+    return [
+        signal
+        for signal in signals
+        if signal.present
+    ]
 
 class FollowUpQuestion(BaseModel):
     scale: str
@@ -1403,6 +1693,12 @@ class NLPAnalysis(BaseModel):
     pss10_symptoms: List[SymptomItem] = Field(default_factory=list)
     sleep_hours_reported: Optional[float] = Field(default=None, ge=0, le=24)
     functional_impairments: List[FunctionalImpairment] = Field(default_factory=list)
+    dissociation_signals: List[DissociationSignal] = Field(
+        default_factory=list
+    )
+    identity_distress_signals: List[IdentityDistressSignal] = Field(
+        default_factory=list
+    )
     active_scale_triggered: ScaleName
     response_to_user: str
     emergency_flag: bool
@@ -1447,8 +1743,10 @@ class MemoryExtraction(BaseModel):
     )
 
 
-_ITEM_ID_RANGES = {"PHQ-9": (1, 9), "GAD-7": (1, 7), "PSS-10": (1, 10)}
-_SCORE_MAX = {"PHQ-9": 3, "GAD-7": 3, "PSS-10": 4}
+# The DSS-B bounds are used only by persisted deliberate sessions. There is no
+# DSS-B passive extractor or active conversational trigger.
+_ITEM_ID_RANGES = {"PHQ-9": (1, 9), "GAD-7": (1, 7), "PSS-10": (1, 10), "DSS-B": (1, 8)}
+_SCORE_MAX = {"PHQ-9": 3, "GAD-7": 3, "PSS-10": 4, "DSS-B": 4}
 
 
 def validate_symptom_items(scale: str, items: List[SymptomItem]) -> List[SymptomItem]:
@@ -1497,6 +1795,12 @@ class ChatAnalytics(BaseModel):
     pss10_symptoms: List[SymptomItem]
     sleep_hours_reported: Optional[float]
     functional_impairments: List[FunctionalImpairment]
+    dissociation_signals: List[DissociationSignal] = Field(
+        default_factory=list
+    )
+    identity_distress_signals: List[IdentityDistressSignal] = Field(
+        default_factory=list
+    )
     active_scale_triggered: ScaleName
     emergency_flag: bool
     pending_score_items: Dict[str, List[int]] = Field(default_factory=dict)
@@ -1588,6 +1892,20 @@ class AnalyzeFrameRequest(BaseModel):
         validation_alias=AliasChoices("image_base64", "image", "frame"),
     )
 
+class AnalyzeFrameSequenceRequest(BaseModel):
+    frames: List[str] = Field(
+        ...,
+        min_length=2,
+        max_length=5,
+    )
+
+
+class AnalyzeFrameSequenceResponse(BaseModel):
+    dominant_emotion: Optional[str]
+    emotion_scores: Dict[str, float]
+    frames_analyzed: int
+    ok: bool
+    error: Optional[str] = None
 
 class AnalyzeFrameResponse(BaseModel):
     dominant_emotion: Optional[str]
@@ -1671,7 +1989,7 @@ class ConversationDetailResponse(BaseModel):
 
 class AssessmentSessionResponse(BaseModel):
     session_id: str
-    scale: Literal["PHQ-9", "GAD-7", "PSS-10"]
+    scale: Literal["PHQ-9", "GAD-7", "PSS-10", "DSS-B"]
     status: Literal["active", "paused", "completed", "cancelled"]
     current_item: Optional[int]
     conversation_id: Optional[str] = None
@@ -1681,7 +1999,7 @@ class AssessmentSessionResponse(BaseModel):
 
 class AssessmentAnswerResponse(BaseModel):
     session_id: str
-    scale: Literal["PHQ-9", "GAD-7", "PSS-10"]
+    scale: Literal["PHQ-9", "GAD-7", "PSS-10", "DSS-B"]
     session_found: bool
     accepted: bool
     status: Literal["active", "paused", "completed", "cancelled", "invalid score"]
@@ -1692,7 +2010,7 @@ class AssessmentAnswerResponse(BaseModel):
 
 
 class AssessmentHistoryResponse(BaseModel):
-    scale: Literal["PHQ-9", "GAD-7", "PSS-10"]
+    scale: Literal["PHQ-9", "GAD-7", "PSS-10", "DSS-B"]
     history: List[Dict[str, Any]]
     limit: int
     has_more: bool
@@ -1704,6 +2022,7 @@ class ProfileResponse(BaseModel):
     username: str
     email: str
     display_name: Optional[str] = None
+    date_of_birth: Optional[date] = None
     preferred_language: Optional[str] = None
     theme: Optional[str] = None
     notification_prefs: Optional[Dict[str, Any]] = None
@@ -1733,6 +2052,19 @@ class ScreeningDetailResponse(BaseModel):
     session: Dict[str, Any]
     items: List[Dict[str, Any]]
 
+class IdentityWellbeingSummary(BaseModel):
+    dissociation_observation_count: int = 0
+    dissociation_signal_types: List[str] = Field(
+        default_factory=list
+    )
+
+    identity_distress_observation_count: int = 0
+    identity_distress_categories: List[str] = Field(
+        default_factory=list
+    )
+
+    functional_impact_observed: bool = False
+    safety_relevance_observed: bool = False
 
 class AnalyticsResponse(BaseModel):
     screening_totals: Dict[str, Optional[int]]
@@ -1749,7 +2081,9 @@ class AnalyticsResponse(BaseModel):
     dynamic_distress: Optional[DynamicDistressStateResponse] = None
     engagement: Optional[Phase2EngagementSummary] = None
     voice_indicators: List[Dict[str, Any]] = Field(default_factory=list)
-
+    identity_wellbeing: IdentityWellbeingSummary = Field(
+        default_factory=IdentityWellbeingSummary
+    )
 
 class ReportResponse(BaseModel):
     generated_at: str
@@ -1766,7 +2100,9 @@ class ReportResponse(BaseModel):
     dynamic_distress: Optional[DynamicDistressStateResponse] = None
     engagement: Optional[Phase2EngagementSummary] = None
     voice_indicators: List[Dict[str, Any]] = Field(default_factory=list)
-
+    identity_wellbeing: IdentityWellbeingSummary = Field(
+        default_factory=IdentityWellbeingSummary
+    )
 
 class WeeklySummaryRouteResponse(BaseModel):
     week_start: str
@@ -1961,6 +2297,7 @@ def _get_profile_sync(user_id: int) -> Optional[DatabaseRow]:
                 u.username,
                 u.email,
                 p.display_name,
+                p.date_of_birth,
                 p.preferred_language,
                 p.theme,
                 p.notification_prefs
@@ -2000,6 +2337,7 @@ async def get_llm_profile(
     
 class ProfileUpdateRequest(BaseModel):
     display_name: Optional[str] = Field(default=None, max_length=80)
+    date_of_birth: Optional[date] = None
     preferred_language: Optional[str] = Field(default=None, max_length=20)
     theme: Optional[str] = Field(default=None, max_length=20)
     notification_prefs: Optional[dict] = None
@@ -2181,7 +2519,7 @@ def require_self(gaash_id: str, user_id: int = Depends(get_current_user_id)) -> 
 # ---------------------------------------------------------------------------
 
 PSS10_REVERSE_ITEMS = {4, 5, 7, 8}
-_SCALE_ITEM_COUNT = {"PHQ-9": 9, "GAD-7": 7, "PSS-10": 10}
+_SCALE_ITEM_COUNT = {"PHQ-9": 9, "GAD-7": 7, "PSS-10": 10, "DSS-B": 8}
 
 
 def _pss10_transform(item_id: int, score: int) -> int:
@@ -2196,8 +2534,10 @@ def compute_total(scale: str, item_scores: Dict[int, int]) -> Optional[int]:
         return None
     total = 0
     for item_id, score in item_scores.items():
-        total += _pss10_transform(item_id, score) if scale == "PSS-10" else score
-    return total
+        if item_id in required:
+            total += _pss10_transform(item_id, score) if scale == "PSS-10" else score
+    maximum_total = {"PHQ-9": 27, "GAD-7": 21, "PSS-10": 40, "DSS-B": 32}[scale]
+    return total if 0 <= total <= maximum_total else None
 
 
 def _clamp_item_score(scale: str, raw_score: int) -> int:
@@ -2279,7 +2619,7 @@ def _get_or_start_session_sync(
             "SELECT * FROM screening_sessions WHERE session_id=%s", (session_id,)
         ).fetchone()
         
-VALID_SCALES = {"PHQ-9", "GAD-7", "PSS-10"}
+VALID_SCALES = {"PHQ-9", "GAD-7", "PSS-10", "DSS-B"}
 
 def normalize_scale(value: str) -> str:
     normalized = value.strip().upper().replace("_", "-")
@@ -2291,6 +2631,8 @@ def normalize_scale(value: str) -> str:
         "GAD-7": "GAD-7",
         "PSS10": "PSS-10",
         "PSS-10": "PSS-10",
+        "DSSB": "DSS-B",
+        "DSS-B": "DSS-B",
     }
 
     if normalized not in aliases:
@@ -2305,6 +2647,29 @@ async def get_or_start_screening_session(
     if scale not in VALID_SCALES:
         raise ValueError(f"Unsupported screening scale: {scale}")
     return await run_db(_get_or_start_session_sync, user_id, conversation_id, scale)
+
+
+def _dssb_adult_eligibility_sync(user_id: int) -> tuple[bool, str]:
+    """Verify adulthood from account data, never from conversation content."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT date_of_birth FROM user_profiles WHERE user_id=%s",
+            (user_id,),
+        ).fetchone()
+    birth_date = row["date_of_birth"] if row is not None else None
+    if not isinstance(birth_date, date):
+        return False, "DSS-B eligibility cannot be verified without a date of birth."
+    today = date.today()
+    age = today.year - birth_date.year - (
+        (today.month, today.day) < (birth_date.month, birth_date.day)
+    )
+    if age < 18:
+        return False, "DSS-B is available only to adults."
+    return True, ""
+
+
+async def check_dssb_adult_eligibility(user_id: int) -> tuple[bool, str]:
+    return await run_db(_dssb_adult_eligibility_sync, user_id)
 
 
 def _active_screening_session_sync(user_id: int) -> Optional[DatabaseRow]:
@@ -2509,7 +2874,7 @@ async def pause_session(user_id: int, session_id: str) -> bool:
 # --- finalized measurement helpers --------------------------------------------
 
 def _latest_finalized_totals_sync(user_id: int) -> Dict[str, Optional[int]]:
-    totals: Dict[str, Optional[int]] = {"PHQ-9": None, "GAD-7": None, "PSS-10": None}
+    totals: Dict[str, Optional[int]] = {"PHQ-9": None, "GAD-7": None, "PSS-10": None, "DSS-B": None}
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT assessment_type, total FROM screening_measurements WHERE user_id=%s "
@@ -2584,7 +2949,7 @@ async def measurement_history(
 
 def _latest_session_snapshot_sync(user_id: int) -> dict:
     """Latest session items per scale (no cross-session combining)."""
-    out: Dict[str, List[dict]] = {"PHQ-9": [], "GAD-7": [], "PSS-10": []}
+    out: Dict[str, List[dict]] = {"PHQ-9": [], "GAD-7": [], "PSS-10": [], "DSS-B": []}
     with get_conn() as conn:
         for scale in out:
             session = conn.execute(
@@ -3101,6 +3466,111 @@ async def get_latest_dynamic_distress_state(user_id: int) -> Optional[DynamicDis
         computed_at=row["computed_at"],
     )
 
+def _identity_wellbeing_summary_sync(
+    user_id: int,
+    days: int = 28,
+) -> dict:
+    with get_conn() as conn:
+
+        dissociation_rows = conn.execute(
+            """
+            SELECT
+                signal_type,
+                functional_impact,
+                safety_relevance
+            FROM dissociation_observations
+            WHERE user_id = %s
+              AND created_at >=
+                  CURRENT_TIMESTAMP
+                  - make_interval(days => %s)
+            ORDER BY created_at DESC
+            """,
+            (
+                user_id,
+                days,
+            ),
+        ).fetchall()
+
+        identity_rows = conn.execute(
+            """
+            SELECT
+                category,
+                functional_impact
+            FROM identity_distress_observations
+            WHERE user_id = %s
+              AND created_at >=
+                  CURRENT_TIMESTAMP
+                  - make_interval(days => %s)
+            ORDER BY created_at DESC
+            """,
+            (
+                user_id,
+                days,
+            ),
+        ).fetchall()
+
+    dissociation_types = sorted(
+        {
+            str(row["signal_type"])
+            for row in dissociation_rows
+            if row.get("signal_type")
+        }
+    )
+
+    identity_categories = sorted(
+        {
+            str(row["category"])
+            for row in identity_rows
+            if row.get("category")
+        }
+    )
+
+    functional_impact = any(
+        bool(row.get("functional_impact"))
+        for row in dissociation_rows
+    ) or any(
+        bool(row.get("functional_impact"))
+        for row in identity_rows
+    )
+
+    safety_relevance = any(
+        bool(row.get("safety_relevance"))
+        for row in dissociation_rows
+    )
+
+    return {
+        "dissociation_observation_count":
+            len(dissociation_rows),
+
+        "dissociation_signal_types":
+            dissociation_types,
+
+        "identity_distress_observation_count":
+            len(identity_rows),
+
+        "identity_distress_categories":
+            identity_categories,
+
+        "functional_impact_observed":
+            functional_impact,
+
+        "safety_relevance_observed":
+            safety_relevance,
+    }
+
+
+async def get_identity_wellbeing_summary(
+    user_id: int,
+    days: int = 28,
+) -> IdentityWellbeingSummary:
+
+    result = await run_db(
+        _identity_wellbeing_summary_sync,
+        user_id,
+        days,
+    )
+
+    return IdentityWellbeingSummary(**result)
 
 async def get_longitudinal_monitoring_payload(user_id: int) -> Dict[str, Any]:
     """Return owned, compact monitoring data for report/analytics endpoints."""
@@ -4204,7 +4674,7 @@ def _export_user_data_sync(
             SELECT *
             FROM conversations
             WHERE user_id = %s
-            ORDER BY timestamp ASC
+            ORDER BY created_at ASC, id ASC
             """,
             (user_id,),
         ).fetchall()
@@ -4234,11 +4704,31 @@ def _export_user_data_sync(
             SELECT *
             FROM screening_measurements
             WHERE user_id = %s
-            ORDER BY timestamp ASC
+            ORDER BY completed_at ASC, id ASC
+            """,
+            (user_id,),
+        ).fetchall()
+        
+        dissociation_observations = conn.execute(
+            """
+            SELECT *
+            FROM dissociation_observations
+            WHERE user_id = %s
+            ORDER BY created_at ASC
             """,
             (user_id,),
         ).fetchall()
 
+        identity_distress_observations = conn.execute(
+            """
+            SELECT *
+            FROM identity_distress_observations
+            WHERE user_id = %s
+            ORDER BY created_at ASC
+            """,
+            (user_id,),
+        ).fetchall()
+        
         reports = conn.execute(
             """
             SELECT *
@@ -4265,6 +4755,15 @@ def _export_user_data_sync(
         ],
         "reports": [
             dict(row) for row in reports
+        ],
+        "dissociation_observations": [
+            dict(row)
+            for row in dissociation_observations
+        ],
+
+        "identity_distress_observations": [
+            dict(row)
+            for row in identity_distress_observations
         ],
     }
 
@@ -4313,7 +4812,31 @@ def _delete_conversation_sync(
                 conversation_id,
             ),
         )
+        
+        conn.execute(
+            """
+            DELETE FROM dissociation_observations
+            WHERE user_id = %s
+              AND conversation_id = %s
+            """,
+            (
+                user_id,
+                conversation_id,
+            ),
+        )
 
+        conn.execute(
+            """
+            DELETE FROM identity_distress_observations
+            WHERE user_id = %s
+              AND conversation_id = %s
+            """,
+            (
+                user_id,
+                conversation_id,
+            ),
+        )
+        
         conn.execute(
             """
             DELETE FROM conversation_messages
@@ -4376,7 +4899,23 @@ def _delete_all_conversations_sync(
             """,
             (user_id,),
         )
+        
+        conn.execute(
+            """
+            DELETE FROM dissociation_observations
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
 
+        conn.execute(
+            """
+            DELETE FROM identity_distress_observations
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+        
         conn.execute(
             """
             DELETE FROM conversation_messages
@@ -4482,7 +5021,21 @@ def _delete_account_sync(user_id: int) -> None:
                 """,
                 (user_id,),
             )
+            cur.execute(
+                """
+                DELETE FROM dissociation_observations
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
 
+            cur.execute(
+                """
+                DELETE FROM identity_distress_observations
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
             cur.execute(
                 """
                 DELETE FROM conversation_messages
@@ -4659,6 +5212,143 @@ async def save_passive_screening_evidence(
 ) -> None:
     await run_db(_save_passive_screening_evidence_sync, user_id, observations)
 
+def _save_dissociation_observations_sync(
+    user_id: int,
+    conversation_id: str,
+    message_id: int,
+    signals: List[DissociationSignal],
+) -> None:
+    """Store structured evidence only; conversation_messages remains the text source."""
+
+    supported = [
+        signal
+        for signal in signals
+        if signal.present
+    ]
+
+    if not supported:
+        return
+
+    with get_conn() as conn:
+        for signal in supported:
+            conn.execute(
+                """
+                INSERT INTO dissociation_observations (
+                    user_id,
+                    conversation_id,
+                    message_id,
+                    signal_type,
+                    frequency_explicit,
+                    functional_impact,
+                    safety_relevance,
+                    source
+                )
+                VALUES (
+                    %s,%s,%s,%s,%s,%s,%s,
+                    'chat_explicit'
+                )
+                ON CONFLICT (
+                    message_id,
+                    signal_type
+                )
+                DO NOTHING
+                """,
+                (
+                    user_id,
+                    conversation_id,
+                    message_id,
+                    signal.type,
+                    signal.frequency_explicit,
+                    signal.functional_impact,
+                    signal.safety_relevance,
+                ),
+            )
+
+        conn.commit()
+
+
+async def save_dissociation_observations(
+    user_id: int,
+    conversation_id: str,
+    message_id: int,
+    signals: List[DissociationSignal],
+) -> None:
+    await run_db(
+        _save_dissociation_observations_sync,
+        user_id,
+        conversation_id,
+        message_id,
+        signals,
+    )
+
+
+def _save_identity_distress_observations_sync(
+    user_id: int,
+    conversation_id: str,
+    message_id: int,
+    signals: List[IdentityDistressSignal],
+) -> None:
+
+    supported = [
+        signal
+        for signal in signals
+        if signal.present
+    ]
+
+    if not supported:
+        return
+
+    with get_conn() as conn:
+        for signal in supported:
+            conn.execute(
+                """
+                INSERT INTO identity_distress_observations (
+                    user_id,
+                    conversation_id,
+                    message_id,
+                    category,
+                    recurrent,
+                    functional_impact,
+                    distress_explicit,
+                    source
+                )
+                VALUES (
+                    %s,%s,%s,%s,%s,%s,%s,
+                    'chat_explicit'
+                )
+                ON CONFLICT (
+                    message_id,
+                    category
+                )
+                DO NOTHING
+                """,
+                (
+                    user_id,
+                    conversation_id,
+                    message_id,
+                    signal.category,
+                    signal.recurrent,
+                    signal.functional_impact,
+                    signal.distress_explicit,
+                ),
+            )
+
+        conn.commit()
+
+
+async def save_identity_distress_observations(
+    user_id: int,
+    conversation_id: str,
+    message_id: int,
+    signals: List[IdentityDistressSignal],
+) -> None:
+    await run_db(
+        _save_identity_distress_observations_sync,
+        user_id,
+        conversation_id,
+        message_id,
+        signals,
+    )
 
 def _save_emotion_sync(
     user_id: int,
@@ -5215,6 +5905,10 @@ def interpret_assessment_total(
             _pss10_band(total)
         ]
 
+    if scale == "DSS-B":
+        # The supplied reference defines no diagnostic or severity bands.
+        return "completed screening score"
+
     return None
 
 def build_weekly_aggregate(averages: dict) -> WeeklyAggregate:
@@ -5568,222 +6262,82 @@ def append_crisis_pathway(response_to_user, pathway) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Visual emotion analysis (DeepFace) — contextual only, never risk input
+# Visual emotion analysis — contextual only, never risk input
 # ---------------------------------------------------------------------------
-
-class VisionAnalysisRuntimeError(Exception):
-    pass
-
-
-def _get_hf_vision_client() -> InferenceClient:
-    if not HF_TOKEN:
-        raise VisionAnalysisRuntimeError(
-            "HF_TOKEN is not configured."
-        )
-
-    if not HF_EMOTION_MODEL:
-        raise VisionAnalysisRuntimeError(
-            "HF_EMOTION_MODEL is not configured."
-        )
-
-    return InferenceClient(
-        provider="hf-inference",
-        api_key=HF_TOKEN,
-    )
-
-_emotion_pipeline = None
-_emotion_model_lock = threading.Lock()
-
-
-def get_hf_emotion_model():
-    global _hf_emotion_processor
-    global _hf_emotion_model
-
-    if (
-        _hf_emotion_processor is None
-        or _hf_emotion_model is None
-    ):
-        _hf_emotion_processor = (
-            AutoImageProcessor.from_pretrained(
-                HF_EMOTION_MODEL
-            )
-        )
-
-        _hf_emotion_model = (
-            AutoModelForImageClassification.from_pretrained(
-                HF_EMOTION_MODEL
-            )
-        )
-
-        _hf_emotion_model.eval()
-
-    return (
-        _hf_emotion_processor,
-        _hf_emotion_model,
-    )
-
-def _analyze_frame_sync(
-    image_bytes: bytes,
-) -> dict:
-
-    processor, model = get_hf_emotion_model()
-
-    image = Image.open(
-        io.BytesIO(image_bytes)
-    ).convert("RGB")
-
-    inputs = processor(
-        images=image,
-        return_tensors="pt",
-    )
-
-    with torch.no_grad():
-        outputs = model(**inputs)
-
-    probabilities = torch.softmax(
-        outputs.logits,
-        dim=-1,
-    )[0]
-
-    id2label = model.config.id2label
-
-    scores = {}
-
-    for index, probability in enumerate(
-        probabilities
-    ):
-        label = id2label[index].lower()
-
-        scores[label] = round(
-            float(probability) * 100,
-            2,
-        )
-
-    dominant_index = int(
-        torch.argmax(probabilities).item()
-    )
-
-    dominant_emotion = (
-        id2label[dominant_index]
-        .lower()
-        .strip()
-    )
-
-    return {
-        "dominant_emotion": dominant_emotion,
-        "emotion_scores": scores,
-    }
-
-_MAX_FRAME_BYTES = 8 * 1024 * 1024
-
-def _decode_base64_image(image_base64: str) -> bytes:
-    payload = image_base64.strip()
-    if payload.startswith("data:"):
-        _, _, payload = payload.partition(",")
-    try:
-        raw = base64.b64decode(payload, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError("image_base64 is not valid base64 data.") from exc
-    if not raw:
-        raise ValueError("image_base64 decoded to an empty image.")
-    if len(raw) > _MAX_FRAME_BYTES:
-        raise ValueError("Image is too large (limit 8 MB).")
-    return raw
-
 
 async def analyze_frame(
     image_base64: str,
 ) -> AnalyzeFrameResponse:
+    """Delegate every submitted frame to the single configured provider."""
+    result: VisualEmotionResult = await visual_emotion_detector.analyze_base64(
+        image_base64
+    )
+    return AnalyzeFrameResponse(
+        dominant_emotion=result.primary,
+        emotion_scores=dict(result.scores),
+        ok=result.ok,
+        error=None if result.ok else result.error_message,
+    )
+    
+async def analyze_frame_sequence(
+    frames: List[str],
+) -> AnalyzeFrameSequenceResponse:
 
-    if not HF_VISION_ENABLED:
-        return AnalyzeFrameResponse(
+    successful_results: List[
+        AnalyzeFrameResponse
+    ] = []
+
+    # Run sequentially intentionally.
+    # Your visual-emotion model is already concurrency-limited.
+    for frame in frames:
+        result = await analyze_frame(frame)
+
+        if result.ok:
+            successful_results.append(result)
+
+    if not successful_results:
+        return AnalyzeFrameSequenceResponse(
             dominant_emotion=None,
             emotion_scores={},
+            frames_analyzed=0,
             ok=False,
             error=(
-                "Visual emotion analysis "
-                "is disabled."
+                "No supplied frame could be "
+                "analysed reliably."
             ),
         )
 
-    try:
-        image_bytes = _decode_base64_image(
-            image_base64
-        )
+    score_totals: Dict[str, float] = {}
 
-    except ValueError as exc:
-        return AnalyzeFrameResponse(
-            dominant_emotion=None,
-            emotion_scores={},
-            ok=False,
-            error=str(exc),
-        )
-
-    try:
-        async with _HF_VISION_SEMAPHORE:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    _analyze_frame_sync,
-                    image_bytes,
-                ),
-                timeout=HF_VISION_TIMEOUT_SECONDS,
+    for result in successful_results:
+        for emotion, score in (
+            result.emotion_scores.items()
+        ):
+            score_totals[emotion] = (
+                score_totals.get(emotion, 0.0)
+                + float(score)
             )
 
-    except TimeoutError:
-        logger.warning(
-            "Hugging Face visual analysis timed out"
-        )
+    count = len(successful_results)
 
-        return AnalyzeFrameResponse(
-            dominant_emotion=None,
-            emotion_scores={},
-            ok=False,
-            error=(
-                "Visual emotion analysis timed out."
-            ),
+    averaged_scores = {
+        emotion: round(
+            total / count,
+            2,
         )
+        for emotion, total
+        in score_totals.items()
+    }
 
-    except VisionAnalysisRuntimeError:
-        return AnalyzeFrameResponse(
-            dominant_emotion=None,
-            emotion_scores={},
-            ok=False,
-            error=(
-                "Visual emotion analysis is "
-                "temporarily unavailable."
-            ),
-        )
+    dominant_emotion = max(
+        averaged_scores,
+        key=averaged_scores.get,
+    )
 
-    except ValueError as exc:
-        return AnalyzeFrameResponse(
-            dominant_emotion=None,
-            emotion_scores={},
-            ok=False,
-            error=str(exc),
-        )
-
-    except Exception:
-        logger.warning(
-            "Unexpected visual emotion analysis failure"
-        )
-
-        return AnalyzeFrameResponse(
-            dominant_emotion=None,
-            emotion_scores={},
-            ok=False,
-            error=(
-                "Visual emotion analysis is "
-                "temporarily unavailable."
-            ),
-        )
-
-    return AnalyzeFrameResponse(
-        dominant_emotion=result[
-            "dominant_emotion"
-        ],
-        emotion_scores=result[
-            "emotion_scores"
-        ],
+    return AnalyzeFrameSequenceResponse(
+        dominant_emotion=dominant_emotion,
+        emotion_scores=averaged_scores,
+        frames_analyzed=count,
         ok=True,
         error=None,
     )
@@ -6406,14 +6960,34 @@ async def read_validated_audio(audio: UploadFile) -> tuple[bytes, str, Any]:
     if inspection.duration_seconds is not None and inspection.duration_seconds > MAX_AUDIO_DURATION_SECONDS:
         raise HTTPException(status_code=413, detail="The audio recording is too long.")
     if VOICE_REQUIRE_VERIFIED_DURATION and not inspection.duration_verified:
+        if inspection.probe_failure == "invalid_media":
+            raise HTTPException(
+                status_code=422,
+                detail="The uploaded audio recording could not be read.",
+            )
+
         raise HTTPException(
-            status_code=422,
-            detail="Audio duration validation is unavailable for this recording format.",
+            status_code=503,
+            detail=(
+                "Audio duration verification is temporarily "
+                "unavailable. Please try again later."
+            ),
         )
+
+
     if VOICE_REQUIRE_VERIFIED_DURATION and not inspection.codec_verified:
+        if inspection.probe_failure == "invalid_media":
+            raise HTTPException(
+                status_code=422,
+                detail="The uploaded audio recording could not be read.",
+            )
+
         raise HTTPException(
-            status_code=422,
-            detail="Audio codec validation is unavailable for this recording format.",
+            status_code=503,
+            detail=(
+                "Audio codec verification is temporarily "
+                "unavailable. Please try again later."
+            ),
         )
 
     # Raw audio is intentionally held only for this request and never written
@@ -6646,6 +7220,15 @@ async def update_profile(
     if data.display_name is not None:
         updates.append("display_name=%s")
         values.append(data.display_name)
+
+    if data.date_of_birth is not None:
+        if data.date_of_birth > date.today():
+            raise HTTPException(
+                status_code=422,
+                detail="Date of birth cannot be in the future.",
+            )
+        updates.append("date_of_birth=%s")
+        values.append(data.date_of_birth)
 
     if data.preferred_language is not None:
         if data.preferred_language not in SUPPORTED_LANGUAGES:
@@ -7154,6 +7737,16 @@ async def chat(
             status_code=503,
             detail="AI service is temporarily unavailable. Please try again shortly.",
         )
+    analysis = analysis.model_copy(
+        update={
+            "identity_distress_signals": (
+                validate_identity_distress_signals(
+                    message_text,
+                    analysis.identity_distress_signals,
+                )
+            )
+        }
+    )
     background_tasks.add_task(
         remember_from_message,
         user_id,
@@ -7179,7 +7772,21 @@ async def chat(
         user_id,
         passive_observations,
     )
+    background_tasks.add_task(
+        save_dissociation_observations,
+        user_id,
+        conversation_id,
+        user_message_id,
+        analysis.dissociation_signals,
+    )
 
+    background_tasks.add_task(
+        save_identity_distress_observations,
+        user_id,
+        conversation_id,
+        user_message_id,
+        analysis.identity_distress_signals,
+    )
     emergency = bool(analysis.emergency_flag)
 
     escalation_created = False
@@ -7329,6 +7936,8 @@ async def chat(
         pss10_symptoms=analysis.pss10_symptoms,
         sleep_hours_reported=analysis.sleep_hours_reported,
         functional_impairments=analysis.functional_impairments,
+        dissociation_signals=analysis.dissociation_signals,
+        identity_distress_signals=analysis.identity_distress_signals,
         active_scale_triggered=analysis.active_scale_triggered,
         emergency_flag=emergency,
         pending_score_items=pending,
@@ -7625,6 +8234,13 @@ async def start_assessment(
     if conversation_id and await verify_conversation(user_id, conversation_id) is None:
         raise HTTPException(status_code=404, detail="Conversation not found.")
 
+    # DSS-B is available solely through this explicit deliberate-screening
+    # route (including a deliberate resume), after verified adult eligibility.
+    if scale == "DSS-B":
+        eligible, reason = await check_dssb_adult_eligibility(user_id)
+        if not eligible:
+            raise HTTPException(status_code=403, detail=reason)
+
     session = await get_or_start_screening_session(
         user_id=user_id,
         conversation_id=conversation_id,
@@ -7762,9 +8378,18 @@ async def get_analytics(
             user_id,
             totals,
         )
-        snapshot, monitoring = await asyncio.gather(
-            get_analytics_snapshot(user_id, days),
-            get_longitudinal_monitoring_payload(user_id),
+        snapshot, monitoring, identity_wellbeing = await asyncio.gather(
+            get_analytics_snapshot(
+                user_id,
+                days,
+            ),
+            get_longitudinal_monitoring_payload(
+                user_id
+            ),
+            get_identity_wellbeing_summary(
+                user_id,
+                days,
+            ),
         )
         period_end = datetime.now(timezone.utc)
         period_start = period_end - timedelta(days=days)
@@ -7777,6 +8402,8 @@ async def get_analytics(
             "period_days": days,
             "period_start": period_start.isoformat(),
             "period_end": period_end.isoformat(),
+            "identity_wellbeing":
+                identity_wellbeing.model_dump(),
             **snapshot,
             **monitoring,
         }
@@ -7803,14 +8430,26 @@ async def wellbeing_report(
             user_id,
             totals,
         )
-        pending, emotions, recommendations, measurements, latest_risk, monitoring = await asyncio.gather(
+        (
+            pending,
+            emotions,
+            recommendations,
+            measurements,
+            latest_risk,
+            monitoring,
+            identity_wellbeing,
+        ) = await asyncio.gather(
             get_pending_score_items(user_id),
             get_recent_emotions(user_id),
             list_recommendations(user_id),
             get_latest_measurements(user_id),
             get_latest_risk(user_id),
             get_longitudinal_monitoring_payload(user_id),
-        )
+            get_identity_wellbeing_summary(
+                user_id,
+                28,
+            ),
+        ) 
 
         return {
             "generated_at": _iso_timestamp(),
@@ -7835,6 +8474,8 @@ async def wellbeing_report(
                 requires_escalation=bool(latest_risk["emergency_flag"]) if latest_risk is not None else False,
             ),
             "safety_status": "screening results are not a diagnosis",
+            "identity_wellbeing":
+                identity_wellbeing.model_dump(),
             **monitoring,
         }
     finally:
@@ -8175,10 +8816,41 @@ async def emotion_analysis(
     user_id: int = Depends(get_current_user_id),
 ):
     enforce_rate_limit(http_request, "visual-emotion", limit=10, window_seconds=600)
-    if not HF_VISION_ENABLED:
+    if not visual_emotion_detector.enabled:
         raise HTTPException(status_code=503, detail="Visual emotion analysis is not enabled.")
     return await analyze_frame(
         request.image_base64
+    )
+    
+@app.post(
+    "/emotion/analyze-sequence",
+    response_model=AnalyzeFrameSequenceResponse,
+)
+async def emotion_sequence_analysis(
+    request: AnalyzeFrameSequenceRequest,
+    http_request: Request,
+    user_id: int = Depends(
+        get_current_user_id
+    ),
+):
+    enforce_rate_limit(
+        http_request,
+        "visual-emotion-sequence",
+        limit=10,
+        window_seconds=600,
+    )
+
+    if not visual_emotion_detector.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Visual emotion analysis "
+                "is not enabled."
+            ),
+        )
+
+    return await analyze_frame_sequence(
+        request.frames
     )
     
 @app.post("/screening/{session_id}/answer", response_model=AssessmentAnswerResponse)
